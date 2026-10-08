@@ -254,6 +254,24 @@ Tell the user, in these terms: **do not move, rename, or copy that file into pla
 
 This is the same diagnosis `block-unreviewed-merge.sh` now prints via `unqualified_marker_hint`; surfacing it here means the operator sees it at `/approve-merge` time rather than one failed merge later.
 
+### 4a. Check a proxied approval (Unattended Mode, AgDR-0222)
+
+When `bin/unattended-supervisor` sent this command into a supervised child session, `APEXYARD_APPROVAL_PROXY` is set. The owner delegated the approval for one run with the human-only `/unattended-plan`. Accept the delegation only while that run's token exists:
+
+```bash
+# (MARKER_HOME already resolved in step 3a.) A no-op that succeeds when the
+# variable is unset, so the attended flow is unchanged.
+# shellcheck source=/dev/null
+. "$MARKER_HOME/.claude/skills/unattended-plan/_lib-unattended-proxy.sh"
+unattended_proxy_check "$MARKER_HOME"
+```
+
+If the check fails, refuse. Print its `REFUSED:` message and end the turn with `UNATTENDED-BLOCKED: privileged <message>`. Do not write the CEO marker. Do not merge.
+
+Only read the token. Never write, `chmod`, or `touch` it: the supervisor halts the run when the token file changes.
+
+The token and this check detect a stopped or tampered run. They do not prevent tampering: a child runs as the same OS user and can read every value the check uses (AgDR-0222 § Consequences).
+
 ### 5. Write the structured CEO marker
 
 The marker is a key/value file with required fields. The format:
@@ -279,17 +297,23 @@ Optional fields the gate stores but doesn't validate:
 | Field | Use |
 |-------|-----|
 | `approved_at=<ISO>` | Audit-log timestamp. Helpful when reviewing past merges. |
-| `approval_summary=<text>` | First ≤200 chars of the user's approval message, sanitised (no shell metachars). Audit trail for "what did the user say when they approved this." |
+| `approval_summary=<text>` | First ≤200 chars of the user's approval message, sanitised (no shell metachars). Audit trail for "what did the user say when they approved this." A proxied approval starts with `[proxy: run=<id> ticket=<n>]` and a space. |
+| `proxy=<text>` | Proxied approvals only (step 4a): the sanitised `APEXYARD_APPROVAL_PROXY` value. It names the run, the PRD, the ticket, and the owner session that started the run. `approved_by` stays `user`, because the owner delegated the approval. |
 
 Use the **ops fork root** as the path anchor (NOT git toplevel — see #229 + #230 for the workspace-clone bug this avoids). Reuse the same MARKER_HOME and the `_lib-review-markers.sh` helper (already sourced in step 4):
 
 ```bash
 # (MARKER_HOME and PR_HOST_REPO already resolved in step 4 — reuse them here.)
+# Re-source the proxy helper: functions do not persist across Bash calls.
+# shellcheck source=/dev/null
+. "$MARKER_HOME/.claude/skills/unattended-plan/_lib-unattended-proxy.sh"
 mkdir -p "$MARKER_HOME/.claude/session/reviews"
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # Sanitise: drop newlines, drop shell-special chars, truncate to 200.
-summary=$(echo "<user approval message>" | tr '\n' ' ' | tr -d '"`$\\' | cut -c1-200)
+# A proxied approval (step 4a) gets a "[proxy: run=<id> ticket=<n>] " prefix
+# first, so the truncation never cuts the proxy label.
+summary=$(printf '%s%s' "$(unattended_proxy_summary_prefix)" "$(echo "<user approval message>" | tr '\n' ' ' | tr -d '"`$\\')" | cut -c1-200)
 
 # CEO marker keyed on the BASE repo — same key as Rex's marker and the gate's
 # lookup (#765). Keying it on the fork would leave a cross-fork merge blocked.
@@ -301,6 +325,10 @@ approved_at=${ts}
 skill_version=2
 approval_summary="${summary}"
 EOF
+# Proxied approvals only: one extra audit line. Nothing is written when
+# APEXYARD_APPROVAL_PROXY is unset. The merge gate parses the marker per key,
+# so the extra line does not change its result.
+unattended_proxy_marker_line >> "$CEO"
 ```
 
 ### 6. Determine merge strategy and release metadata
