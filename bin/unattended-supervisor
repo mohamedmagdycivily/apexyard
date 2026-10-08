@@ -1,0 +1,1032 @@
+#!/bin/bash
+# unattended-supervisor — drive one PRD run in Unattended Mode (AgDR-0222).
+#
+# Started by the human-only /unattended-plan skill (detached with setsid), or
+# by hand from a terminal for --rehearse. It is a bash process, not a Claude
+# session: the model runs only inside the child sessions it starts, plus one
+# stateless capped "decide" call for a free-form question.
+#
+# What it does, in order:
+#   1. Planning: when the PRD's sidecar (<prd-basename>.unattended.json) does
+#      not exist, run a planning child session that finds or files the PRD's
+#      tickets through the existing ticket skills and reports them with
+#      UNATTENDED-TICKETS. Verify every number, order by blocked-by, write the
+#      sidecar. An existing sidecar always wins.
+#   2. Tickets, strictly in series: one fresh headless child session per
+#      ticket. Read each turn's last line (.claude/rules/unattended-mode.md),
+#      reply as the owner would, send /approve-design and /approve-merge after
+#      the supervisor's own checks, and start ticket N+1 only after ticket N's
+#      PR is MERGED and the ticket is closed.
+#   3. Stop, resume, state, logs, summary.
+#
+# Gates, hooks, and markers do not change. Children run with hooks on.
+#
+# Usage:
+#   unattended-supervisor run    --prd <path> --project <name> --repo <owner/repo>
+#                                [--workspace <dir>] [--ops-root <dir>]
+#                                [--plan-only] [--tickets 12,14] [--rehearse]
+#                                [--dry-run] [--resume]
+#   unattended-supervisor status --prd <path> --project <name> [--ops-root <dir>]
+#   unattended-supervisor paths  --prd <path> --project <name> [--ops-root <dir>]
+#
+# Test seams (environment):
+#   UNATTENDED_CLAUDE_BIN   the claude CLI to run (default: claude)
+#   UNATTENDED_TTY          where --rehearse reads a keypress (default: /dev/tty)
+#   UNATTENDED_LIB_ROOT     where .claude/hooks + templates live (default: this repo)
+#
+# Exit codes: 0 done or plan written, 1 halted, 2 usage error, 3 lock held.
+
+set -u
+# State, the run token, and the turn transcripts can hold secrets from tool
+# output. Keep them private to the owner (security review of #7, M3).
+umask 077
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_ROOT="${UNATTENDED_LIB_ROOT:-$(cd "$SELF_DIR/.." && pwd)}"
+CLAUDE_BIN="${UNATTENDED_CLAUDE_BIN:-claude}"
+
+# shellcheck source=../.claude/skills/unattended-plan/_lib-unattended-protocol.sh
+. "$LIB_ROOT/.claude/skills/unattended-plan/_lib-unattended-protocol.sh"
+
+# The parent session's variables. A child that inherits them pins its hooks
+# and markers to the parent's session (PRD-001 Technical Constraints).
+SCRUB_VARS="CLAUDECODE CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION \
+CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_SSE_PORT \
+CLAUDE_PID CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ATTENDED \
+APEXYARD_UNATTENDED_SUPERVISED APEXYARD_APPROVAL_PROXY APEXYARD_UNATTENDED_RUN_ID"
+
+CHILD_ALLOWED_TOOLS="Bash,Read,Edit,Write,MultiEdit,Glob,Grep,Agent,Skill,WebFetch,WebSearch,TodoWrite"
+CHILD_DISALLOWED_TOOLS="AskUserQuestion,EnterWorktree,ExitWorktree"
+# The halt hooks and the block messages they print (PRD US-7). The hooks do
+# not print their own file name, so match the message.
+HALT_PATTERNS="block-privileged-escalation.sh|privilege escalation or verification bypass is not available
+check-secrets.sh|Potential hardcoded secrets detected
+block-main-push.sh|Cannot commit directly on protected branch
+block-main-push.sh|Cannot push directly to a protected branch"
+
+MAX_PLANNING_TURNS=40
+MAX_TICKET_TURNS=80
+
+# ---------------------------------------------------------------- arguments --
+
+CMD="${1:-}"
+[ $# -gt 0 ] && shift
+PRD="" PROJECT="" REPO="" WORKSPACE="" OPS=""
+PLAN_ONLY=0 REHEARSE=0 DRY_RUN=0 RESUME=0 TICKET_FILTER=""
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  unattended-supervisor run    --prd <path> --project <name> --repo <owner/repo>
+                               [--workspace <dir>] [--ops-root <dir>]
+                               [--plan-only] [--tickets 12,14] [--rehearse]
+                               [--dry-run] [--resume]
+  unattended-supervisor status --prd <path> --project <name> [--ops-root <dir>]
+  unattended-supervisor paths  --prd <path> --project <name> [--ops-root <dir>]
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prd) PRD="${2:-}"; shift 2 ;;
+    --project) PROJECT="${2:-}"; shift 2 ;;
+    --repo) REPO="${2:-}"; shift 2 ;;
+    --workspace) WORKSPACE="${2:-}"; shift 2 ;;
+    --ops-root) OPS="${2:-}"; shift 2 ;;
+    --tickets) TICKET_FILTER="${2:-}"; shift 2 ;;
+    --plan-only) PLAN_ONLY=1; shift ;;
+    --rehearse) REHEARSE=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --resume) RESUME=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unattended-supervisor: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+case "$CMD" in run|status|paths) ;; *) usage >&2; exit 2 ;; esac
+if [ -z "$PRD" ] || [ -z "$PROJECT" ]; then
+  echo "unattended-supervisor: --prd and --project are required" >&2; exit 2
+fi
+if [ -n "$TICKET_FILTER" ] && ! printf '%s' "$TICKET_FILTER" | grep -Eq '^[0-9]+(,[0-9]+)*$'; then
+  echo "unattended-supervisor: --tickets takes a comma-separated list of numbers" >&2; exit 2
+fi
+
+[ -z "$OPS" ] && OPS="$LIB_ROOT"
+case "$PRD" in /*) ;; *) PRD="$(cd "$(dirname "$PRD")" 2>/dev/null && pwd)/$(basename "$PRD")" ;; esac
+
+PRD_BASE="$(basename "$PRD")"; PRD_BASE="${PRD_BASE%.md}"
+SLUG="$(printf '%s-%s' "$PROJECT" "$PRD_BASE" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+STATE_DIR="$OPS/.claude/session/unattended/$SLUG"
+SIDECAR="$(dirname "$PRD")/$PRD_BASE.unattended.json"
+STATE="$STATE_DIR/state.json"
+TOKEN="$STATE_DIR/run.token"
+LOCK="$STATE_DIR/lock"
+STOP="$STATE_DIR/stop"
+APPROVALS="$STATE_DIR/approvals.jsonl"
+SVLOG="$STATE_DIR/supervisor.log"
+SUMMARY="$STATE_DIR/summary.md"
+
+if [ "$CMD" = paths ]; then
+  printf 'slug=%s\nstate_dir=%s\nsidecar=%s\n' "$SLUG" "$STATE_DIR" "$SIDECAR"
+  exit 0
+fi
+
+# ------------------------------------------------------------------ helpers --
+
+log() {
+  local line
+  # One record per line: a newline in a detail cannot forge a log line.
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $(printf '%s' "$*" | tr '\n\r' '  ')"
+  printf '%s\n' "$line" >&2
+  [ "$DRY_RUN" = 1 ] && return 0
+  mkdir -p "$STATE_DIR" && printf '%s\n' "$line" >> "$SVLOG"
+}
+
+die() { echo "unattended-supervisor: $*" >&2; exit 2; }
+
+fadd() { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN { printf "%.4f", a + b }'; }
+fge()  { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN { exit !(a >= b) }'; }
+
+new_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr '[:upper:]' '[:lower:]'
+  else cat /proc/sys/kernel/random/uuid; fi
+}
+
+# token_fingerprint — content checksum + inode of the run token. A child can
+# write the state dir, so the supervisor halts when the token disappears OR
+# changes during the run, not only when its run_id is wrong (review of #7, M1).
+token_fingerprint() {
+  [ -f "$TOKEN" ] || return 0
+  # inode + change time (nanoseconds): a delete-and-recreate with identical
+  # content can reuse the inode number, but never the change time.
+  printf '%s:%s' "$(cksum < "$TOKEN" | tr -d ' ')" "$(stat -c '%i %z' "$TOKEN" 2>/dev/null || stat -f '%i %c' "$TOKEN")"
+}
+
+# token_intact → 0 when the token is the one this run started with.
+token_intact() {
+  [ -f "$TOKEN" ] && [ "$(token_get run_id)" = "$RUN_ID" ] && [ "$(token_fingerprint)" = "$TOKEN_FP" ]
+}
+
+# sidecar_fingerprint — the sidecar may change between runs (the owner edits
+# it), but not during one (review of #7, L1).
+sidecar_fingerprint() { [ -f "$SIDECAR" ] && cksum < "$SIDECAR" | tr -d ' '; }
+
+# token_get <key> — read one key=value from the run token.
+token_get() { [ -f "$TOKEN" ] && sed -n "s/^$1=//p" "$TOKEN" | head -1; }
+
+# ---------------------------------------------------------------- state.json --
+
+st() { jq -r "$@" "$STATE"; }
+
+# st_set <jq filter> [jq args...] — atomic write (tmp + mv). The supervisor
+# holds the lock, so it is the only writer.
+st_set() {
+  local filter="$1" tmp; shift
+  tmp="$STATE.tmp.$$"
+  if jq "$@" "$filter" "$STATE" > "$tmp"; then mv "$tmp" "$STATE"
+  else rm -f "$tmp"; log "ERROR: state update failed: $filter"; return 1; fi
+}
+
+# tk_get <n> <field> / tk_set <n> <field> <json-value>
+tk_get() { jq -r --argjson n "$1" ".tickets[] | select(.n == \$n) | .$2 // empty" "$STATE"; }
+tk_set() { st_set "(.tickets[] | select(.n == \$n) | .$2) = \$v" --argjson n "$1" --argjson v "$3"; }
+tk_inc() { local v; v="$(tk_get "$1" "$2")"; v=$(( ${v:-0} + 1 )); tk_set "$1" "$2" "$v"; printf '%s' "$v"; }
+tk_str() { st_set "(.tickets[] | select(.n == \$n) | .$2) = \$v" --argjson n "$1" --arg v "$3"; }
+
+needs_owner() { # <ticket|null> <code> <detail>
+  local t="$1" code="$2" detail="$3"
+  st_set '.needs_owner += [{ticket: $t, code: $c, detail: $d, at: $at}]' \
+    --argjson t "${t:-null}" --arg c "$code" --arg d "$detail" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  log "NEEDS-OWNER ticket=${t:-none} code=$code detail=$detail"
+}
+
+halt() { st_set '.halted = $r' --arg r "$1"; log "HALT: $1"; }
+
+# ------------------------------------------------------------------- lock ----
+
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  if ( set -C; printf '%s\n' "$$" > "$LOCK" ) 2>/dev/null; then return 0; fi
+  local holder; holder="$(cat "$LOCK" 2>/dev/null)"
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    echo "unattended-supervisor: another supervisor (PID $holder) holds $LOCK" >&2
+    exit 3
+  fi
+  log "WARNING: reclaiming a stale lock from dead PID ${holder:-unknown}"
+  rm -f "$LOCK"
+  if ! ( set -C; printf '%s\n' "$$" > "$LOCK" ) 2>/dev/null; then
+    echo "unattended-supervisor: another supervisor took the lock at $LOCK" >&2
+    exit 3
+  fi
+}
+
+release_lock() {
+  [ -f "$LOCK" ] && [ "$(cat "$LOCK" 2>/dev/null)" = "$$" ] && rm -f "$LOCK"
+  return 0
+}
+
+# ------------------------------------------------------------ tracker + gh ---
+
+load_tracker_lib() {
+  # shellcheck source=/dev/null
+  . "$LIB_ROOT/.claude/hooks/_lib-tracker.sh" 2>/dev/null || true
+  # shellcheck source=/dev/null
+  . "$LIB_ROOT/.claude/hooks/_lib-review-markers.sh"
+}
+
+# issue_json <n> — normalised {state,title,url,labels,body} or empty.
+issue_json() {
+  if declare -F tracker_view >/dev/null 2>&1; then
+    tracker_view "$1" "$REPO" 2>/dev/null
+  else
+    gh issue view "$1" --repo "$REPO" --json state,title,url,labels,body 2>/dev/null
+  fi
+}
+
+issue_closed() { # <n> → 0 when the tracker reports the ticket closed
+  local s; s="$(issue_json "$1" | jq -r '.state // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  case "$s" in closed|done|resolved|completed) return 0 ;; esac
+  return 1
+}
+
+pr_json() { # <pr>
+  gh pr view "$1" --repo "$REPO" --json number,state,isDraft,headRefOid,headRefName,url 2>/dev/null
+}
+
+pr_state() { pr_json "$1" | jq -r '.state // empty' 2>/dev/null; }
+
+ci_red() { # <pr> → 0 when any check failed. gh exits non-zero while
+  # checks fail or run, so read the JSON whatever the exit code.
+  local out n
+  out="$(gh pr checks "$1" --repo "$REPO" --json bucket 2>/dev/null)"
+  n="$(printf '%s' "${out:-[]}" | jq '[.[]? | select(.bucket == "fail")] | length' 2>/dev/null)"
+  [ "${n:-0}" -gt 0 ]
+}
+
+rex_sha() { # <pr> → the SHA in Rex's repo-qualified marker, or empty
+  local m; m="$(review_marker_path "$REPO" "$1" rex "$OPS")"
+  [ -f "$m" ] && tr -d '[:space:]' < "$m"
+}
+
+# rex_posted <pr> <head> → 0 when a review or comment on the PR carries the
+# "Reviewed commit" footer for this HEAD (code-reviewer.md output format).
+rex_posted() {
+  gh pr view "$1" --repo "$REPO" --json reviews,comments 2>/dev/null \
+    | jq -e --arg h "$2" '[(.reviews // [])[]?.body, (.comments // [])[]?.body] | map(select(. != null))
+        | any(test("Reviewed commit") and contains($h))' >/dev/null 2>&1
+}
+
+# find_ticket_pr <n> — the newest PR whose head branch is {type}/[GH-|#]<n>-...
+find_ticket_pr() {
+  gh pr list --repo "$REPO" --state all --limit 100 --json number,headRefName 2>/dev/null \
+    | jq -r --arg n "$1" '[.[] | select(.headRefName | test("^[a-z]+/(GH-|#)?" + $n + "-"))] | sort_by(.number) | last | .number // empty' 2>/dev/null
+}
+
+# add_decide_cost — fold the decide calls' cost into the run total.
+add_decide_cost() {
+  local f="$STATE_DIR/decide.cost" c total=0
+  [ -f "$f" ] || return 0
+  while IFS= read -r c; do total="$(fadd "$total" "${c:-0}")"; done < "$f"
+  rm -f "$f"
+  st_set '.cost_usd = ((.cost_usd // 0) + $c)' --argjson c "$total"
+}
+
+# ---------------------------------------------------------- child sessions ---
+
+TURN_TEXT="" TURN_OK=0 TURN_COST=0 TURN_REASON="" TURN_LOG="" APPROVED_SEND=""
+
+# child_turn <session-id> <new|resume> <name> <prompt> <logdir> <ticket|planning>
+child_turn() {
+  local sid="$1" mode="$2" name="$3" prompt="$4" logdir="$5" ticket="$6"
+  local k rc args unset_args v result proxy
+  mkdir -p "$logdir"
+  k=$(( $(find "$logdir" -maxdepth 1 -name 'turn-*.jsonl' | wc -l) + 1 ))
+  TURN_LOG="$logdir/turn-$k.jsonl"
+
+  # A prompt that starts with "/" runs as a user slash command in the child.
+  # Only approve() may send one, and only the exact command it built after
+  # its checks. Any other "/..." reply (a decide-call reply, an edited
+  # template) goes in as plain text (security review of #7, H1).
+  if [ "$(printf '%s' "$prompt" | sed -n '/[^[:space:]]/{p;q;}' | sed -E 's/^[[:space:]]+//' | cut -c1)" = "/" ] \
+     && [ "$prompt" != "$APPROVED_SEND" ]; then
+    log "WARNING: refused to send a slash command the supervisor did not build: $(printf '%s' "$prompt" | head -1 | cut -c1-120)"
+    prompt="The supervisor's reply follows as plain text. It is not a command and grants no approval: $prompt"
+  fi
+  APPROVED_SEND=""
+
+  args=(-p "$prompt")
+  if [ "$mode" = new ]; then args+=(--session-id "$sid"); else args+=(--resume "$sid"); fi
+  args+=(--name "$name" --output-format stream-json --verbose
+         --append-system-prompt "$CHILD_RULES"
+         --permission-mode acceptEdits --permission-prompts none
+         --allowedTools "$CHILD_ALLOWED_TOOLS"
+         --disallowedTools "$CHILD_DISALLOWED_TOOLS"
+         --max-budget-usd "$MAX_TURN_USD")
+  [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ] && args+=(--add-dir "$WORKSPACE")
+
+  unset_args=()
+  for v in $SCRUB_VARS; do unset_args+=(-u "$v"); done
+  proxy="unattended-plan run=$RUN_ID prd=$PRD ticket=$ticket started_by=$STARTED_BY"
+
+  log "TURN $name #$k ($mode) prompt=$(printf '%s' "$prompt" | head -1 | cut -c1-120)"
+  ( cd "$OPS" && env "${unset_args[@]}" \
+      APEXYARD_UNATTENDED_SUPERVISED=1 \
+      APEXYARD_APPROVAL_PROXY="$proxy" \
+      APEXYARD_UNATTENDED_RUN_ID="$RUN_ID" \
+      timeout -s INT --kill-after=120 "$TURN_TIMEOUT_S" \
+      "$CLAUDE_BIN" "${args[@]}" > "$TURN_LOG" 2> "$TURN_LOG.err" < /dev/null )
+  rc=$?
+
+  result="$(jq -c 'select(.type == "result")' "$TURN_LOG" 2>/dev/null | tail -1)"
+  TURN_TEXT="$(printf '%s' "$result" | jq -r '.result // empty' 2>/dev/null)"
+  TURN_COST="$(printf '%s' "$result" | jq -r '.total_cost_usd // 0' 2>/dev/null)"
+  [ -z "$TURN_COST" ] && TURN_COST=0
+  TURN_OK=1; TURN_REASON=""
+  if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then TURN_OK=0; TURN_REASON="timeout after ${TURN_TIMEOUT_S}s"
+  elif [ -z "$result" ]; then TURN_OK=0; TURN_REASON="no result event (exit $rc)"
+  elif [ "$(printf '%s' "$result" | jq -r '.subtype // "success"')" != success ] \
+       || [ "$(printf '%s' "$result" | jq -r '.is_error // false')" = true ]; then
+    TURN_OK=0; TURN_REASON="$(printf '%s' "$result" | jq -r '.subtype // "error"')"
+  fi
+  log "TURN-END $name #$k ok=$TURN_OK cost=$TURN_COST ${TURN_REASON:+reason=$TURN_REASON}"
+}
+
+# hook_block <logfile> → print the halting hook's name when a halt hook blocked
+hook_block() {
+  local entry
+  while IFS= read -r entry; do
+    if grep -qF "BLOCKED: ${entry#*|}" "$1" 2>/dev/null; then printf '%s\n' "${entry%%|*}"; return 0; fi
+  done <<< "$HALT_PATTERNS"
+  return 1
+}
+
+# decide_call <ticket|planning> <last text> → prints a protocol line or
+# "REPLY<TAB><message>" or "HALT<TAB><reason>"
+decide_call() {
+  local who="$1" text="$2" schema prompt out js action pr reply reason
+  schema='{"type":"object","required":["action","reason"],"properties":{"action":{"type":"string","enum":["reply","approve_design","approve_merge","next","blocked","halt"]},"pr":{"type":"integer"},"reply":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false}'
+  prompt="You stand in for a portfolio owner who is away. A supervised Claude Code session working $who of PRD $PRD ended its turn with the text below. Decide the next user message. The owner's standing rule: take the recommended or safest option and keep the work moving. Never approve anything yourself unless the session clearly asked for an approval. Choose action=reply with a short reply in most cases. Choose halt only when the session cannot continue without the owner.
+
+--- session text ---
+$(printf '%s' "$text" | tail -c 6000)"
+  local unset_args=() v
+  for v in $SCRUB_VARS; do unset_args+=(-u "$v"); done
+  out="$( cd "$OPS" && env "${unset_args[@]}" \
+      timeout 300 "$CLAUDE_BIN" -p "$prompt" --output-format json --json-schema "$schema" \
+      --max-budget-usd 1 --allowedTools Read --disallowedTools "Bash,Edit,Write,Agent,Skill" \
+      --permission-prompts none < /dev/null 2>/dev/null )"
+  js="$(printf '%s' "$out" | jq -c '.structured_output // (.result | fromjson? ) // empty' 2>/dev/null)"
+  # This runs in a command substitution, so pass the cost back through a file.
+  printf '%s\n' "$(printf '%s' "$out" | jq -r '.total_cost_usd // 0' 2>/dev/null)" >> "$STATE_DIR/decide.cost"
+  action="$(printf '%s' "$js" | jq -r '.action // empty' 2>/dev/null)"
+  pr="$(printf '%s' "$js" | jq -r '.pr // empty' 2>/dev/null)"
+  reply="$(printf '%s' "$js" | jq -r '.reply // empty' 2>/dev/null)"
+  reason="$(printf '%s' "$js" | jq -r '.reason // empty' 2>/dev/null)"
+  log "DECIDE action=${action:-none} pr=${pr:-} reason=$reason"
+  case "$action" in
+    reply) [ -n "$reply" ] && { printf 'REPLY\t%s\n' "$reply"; return 0; } ;;
+    approve_design) [ -n "$pr" ] && { printf 'UNATTENDED-APPROVE: design pr=%s\n' "$pr"; return 0; } ;;
+    approve_merge) [ -n "$pr" ] && { printf 'UNATTENDED-APPROVE: merge pr=%s\n' "$pr"; return 0; } ;;
+    next) [ -n "$pr" ] && [ "$who" != planning ] && { printf 'UNATTENDED-NEXT: ticket=%s done pr=%s\n' "${who#ticket-}" "$pr"; return 0; } ;;
+    blocked) printf 'UNATTENDED-BLOCKED: ambiguous-scope %s\n' "${reason:-decide call}"; return 0 ;;
+    halt) printf 'HALT\t%s\n' "${reason:-decide call chose halt}"; return 0 ;;
+  esac
+  printf 'HALT\t%s\n' "decide call returned no usable action"
+}
+
+rehearse_pause() { # <what>
+  [ "$REHEARSE" = 1 ] || return 0
+  local ans=""
+  printf '\n[rehearse] About to send: %s\n[rehearse] Press Enter to send, or type q then Enter to stop: ' "$1" >&2
+  IFS= read -r ans < "${UNATTENDED_TTY:-/dev/tty}" || ans=q
+  [ "$ans" = q ] && return 1
+  return 0
+}
+
+record_approval() { # <ticket> <pr> <kind> <head> <rex> <command> <result>
+  printf '%s\n' "$(jq -cn --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg run "$RUN_ID" \
+    --argjson t "$1" --argjson pr "$2" --arg kind "$3" --arg head "$4" --arg rex "$5" \
+    --arg cmd "$6" --arg res "$7" --arg by "$STARTED_BY" \
+    '{at:$at, run:$run, ticket:$t, pr:$pr, kind:$kind, head:$head, rex:$rex, command:$cmd, result:$res, started_by:$by}')" >> "$APPROVALS"
+}
+
+# --------------------------------------------------------------- templates ---
+
+fill() { # <text> KEY=VALUE... — replace {{KEY}} literally
+  local text="$1" kv key val; shift
+  # Quote the pattern AND the replacement: with bash 5.2's patsub_replacement
+  # an unquoted & in the replacement expands to the matched text.
+  for kv in "$@"; do key="${kv%%=*}"; val="${kv#*=}"; text="${text//"{{$key}}"/"$val"}"; done
+  printf '%s' "$text"
+}
+
+strip_comment() { sed '/^<!--.*-->$/d'; }
+
+planning_prompt() {
+  fill "$TPL_PLANNING" \
+    "PRD=$PRD" "PROJECT=$PROJECT" "REPO=$REPO" "WORKSPACE=${WORKSPACE:-none}"
+}
+
+ticket_prompt() { # <n>
+  local n="$1" title deps dep_prs="" d p exec_block ep
+  title="$(tk_get "$n" title)"
+  deps="$(jq -r --argjson n "$n" '.tickets[] | select(.n == $n) | .blocked_by[]?' "$STATE")"
+  for d in $deps; do p="$(tk_get "$d" pr)"; dep_prs="${dep_prs}#$d → PR #${p:-?}, "; done
+  dep_prs="${dep_prs%, }"; [ -z "$dep_prs" ] && dep_prs="none"
+  ep=""
+  if [ -n "$EXEC_PROMPT_TEXT" ]; then
+    ep=1
+    exec_block="$EXEC_PROMPT_TEXT
+
+This session covers only ticket #$n."
+  fi
+  [ -z "$ep" ] && exec_block="$TPL_GENERIC"
+  exec_block="$(fill "$exec_block" "TICKET=$n" "REPO=$REPO")"
+  fill "$TPL_TICKET" \
+    "EXECUTION_PROMPT=$exec_block" "TICKET=$n" "TITLE=$title" "PROJECT=$PROJECT" \
+    "REPO=$REPO" "WORKSPACE=${WORKSPACE:-none}" "PRD=$PRD" "EPIC=$(st '.epic // "none"')" \
+    "BLOCKED_BY_PRS=$dep_prs"
+}
+
+NUDGE="Your last message did not end with exactly one UNATTENDED- line. End this turn with one line from the table in your system prompt, as the very last line."
+
+# ----------------------------------------------------------------- sidecar ---
+
+DEFAULT_CONFIG='{"execution_prompt":"","max_turn_usd":15,"max_ticket_usd":60,"max_run_usd":300,"turn_timeout_s":5400,"notify_webhook":""}'
+
+load_config() {
+  local cfg
+  cfg="$(jq -c --argjson d "$DEFAULT_CONFIG" '$d + (.config // {})' "$SIDECAR")"
+  MAX_TURN_USD="$(printf '%s' "$cfg" | jq -r .max_turn_usd)"
+  MAX_TICKET_USD="$(printf '%s' "$cfg" | jq -r .max_ticket_usd)"
+  MAX_RUN_USD="$(printf '%s' "$cfg" | jq -r .max_run_usd)"
+  TURN_TIMEOUT_S="$(printf '%s' "$cfg" | jq -r .turn_timeout_s)"
+  local ep; ep="$(printf '%s' "$cfg" | jq -r '.execution_prompt // ""')"
+  EXEC_PROMPT_TEXT=""
+  if [ -n "$ep" ]; then
+    case "$ep" in /*) ;; *) ep="$(dirname "$PRD")/$ep" ;; esac
+    if [ -f "$ep" ]; then EXEC_PROMPT_TEXT="$(cat "$ep")"
+    else log "WARNING: execution_prompt $ep not found, using the generic prompt"; fi
+  fi
+}
+
+# order_tickets <json array of {n,blocked_by}> → space-separated n in
+# dependency order, ties by number. A cycle falls back to number order.
+order_tickets() {
+  local arr="$1" placed=" " out="" progress n deps d ok all
+  all="$(printf '%s' "$arr" | jq -r '[.[].n] | sort | .[]')"
+  while :; do
+    progress=0
+    for n in $all; do
+      case "$placed" in *" $n "*) continue ;; esac
+      deps="$(printf '%s' "$arr" | jq -r --argjson n "$n" '.[] | select(.n == $n) | .blocked_by[]?')"
+      ok=1
+      for d in $deps; do case "$placed" in *" $d "*) ;; *) ok=0 ;; esac; done
+      if [ "$ok" = 1 ]; then placed="$placed$n "; out="$out $n"; progress=1; break; fi
+    done
+    [ "$progress" = 0 ] && break
+  done
+  for n in $all; do
+    case "$placed" in *" $n "*) ;; *) log "WARNING: blocked-by cycle at #$n, using number order"; out="$out $n" ;; esac
+  done
+  printf '%s\n' "${out# }"
+}
+
+# write_sidecar <epic> <n1,n2,...> — verify, order, write. Prints an error
+# message and returns 1 when a number does not resolve.
+write_sidecar() {
+  local epic="$1" list="$2" n js arr="[]" listed missing="" order out
+  listed=" $(printf '%s' "$list" | tr ',' ' ') "
+  for n in $(printf '%s' "$list" | tr ',' ' '); do
+    js="$(issue_json "$n")"
+    if [ -z "$js" ]; then missing="$missing #$n"; continue; fi
+    if issue_closed "$n"; then log "PLAN: #$n is closed, dropped"; continue; fi
+    arr="$(printf '%s' "$arr" | jq -c --argjson n "$n" --argjson js "$js" --arg listed "$listed" '
+      . + [{ n: $n,
+             title: ($js.title // "" | sub("^\\[[A-Za-z]+\\] *"; "")),
+             blocked_by: ([ ($js.body // "") | scan("(?i)(?:blocked by|depends on):? *#([0-9]+)") | .[0] | tonumber ]
+                          | unique | map(select(. as $d | $listed | contains(" \($d) ")))),
+             owner_only: false,
+             ui: ([ ($js.labels // [])[] | (if type == "object" then .name else . end) | ascii_downcase ]
+                  | any(test("^(ui|frontend|design)$"))) }]')"
+  done
+  if [ -n "$missing" ]; then printf 'These tickets do not exist in %s:%s' "$REPO" "$missing"; return 1; fi
+  order="$(order_tickets "$arr")"
+  out="$(printf '%s' "$arr" | jq --argjson cfg "$DEFAULT_CONFIG" --arg order "$order" --arg epic "$epic" '
+    ($order | split(" ") | map(select(. != "") | tonumber)) as $o
+    | { config: $cfg,
+        epic: (if $epic == "" then null else ($epic | tonumber) end),
+        tickets: [ $o[] as $n | .[] | select(.n == $n) ] }')"
+  printf '%s\n' "$out" > "$SIDECAR.tmp.$$" && mv "$SIDECAR.tmp.$$" "$SIDECAR"
+  log "PLAN: wrote $SIDECAR (order: $order)"
+}
+
+# ---------------------------------------------------------------- planning ---
+
+run_planning() {
+  local sid mode prompt end parsed kind missing=0 retries=0 turns=0 res
+  sid="$(st '.planning.session // empty')"
+  if [ -z "$sid" ]; then
+    sid="$(new_uuid)"; st_set '.planning = {session: $s, turns: 0, cost: 0}' --arg s "$sid"
+    mode=new; prompt="$(planning_prompt)"
+  else
+    mode=resume; prompt="You were interrupted. Re-check which tickets exist and end with UNATTENDED-TICKETS."
+  fi
+  while :; do
+    [ -f "$STOP" ] && { halt "stopped by the owner (stop file) during planning"; return 1; }
+    if ! token_intact; then needs_owner null token "the run token was removed or changed during planning"; halt "run token removed or changed"; return 1; fi
+    turns=$((turns + 1))
+    [ "$turns" -gt "$MAX_PLANNING_TURNS" ] && { needs_owner null planning "planning ran $MAX_PLANNING_TURNS turns"; halt "planning did not finish"; return 1; }
+    child_turn "$sid" "$mode" "unattended:$PROJECT:$PRD_BASE:planning" "$prompt" "$STATE_DIR/logs/planning" planning
+    mode=resume
+    st_set '.planning.turns += 1 | .planning.cost = ((.planning.cost // 0) + $c) | .cost_usd = ((.cost_usd // 0) + $c)' --argjson c "$TURN_COST"
+    if h="$(hook_block "$TURN_LOG")"; then needs_owner null privileged "$h blocked a command in planning"; halt "$h blocked a command"; return 1; fi
+    if fge "$(st '.cost_usd')" "$MAX_RUN_USD"; then halt "run cost reached max_run_usd ($MAX_RUN_USD)"; return 1; fi
+    if [ "$TURN_OK" != 1 ]; then
+      needs_owner null turn-failed "planning turn failed: $TURN_REASON"; halt "planning turn failed"; return 1
+    fi
+    end="$(up_end_line "$TURN_TEXT")"
+    if [ -z "$end" ] || ! up_is_last_line "$TURN_TEXT"; then
+      missing=$((missing + 1))
+      case "$missing" in
+        1) prompt="$NUDGE"; continue ;;
+        2) res="$(decide_call planning "$TURN_TEXT")"; add_decide_cost
+           case "$res" in
+             REPLY*) prompt="${res#REPLY	}"; continue ;;
+             HALT*) needs_owner null no-endline "${res#HALT	}"; halt "planning session gave no end line"; return 1 ;;
+             *) end="$res" ;;
+           esac ;;
+        *) needs_owner null no-endline "planning session gave no end line three times"; halt "planning session gave no end line"; return 1 ;;
+      esac
+    else
+      missing=0
+    fi
+    parsed="$(up_parse "$end")"; kind="${parsed%%	*}"
+    case "$kind" in
+      tickets)
+        local epic list err
+        epic="$(printf '%s' "$parsed" | cut -f2)"; list="$(printf '%s' "$parsed" | cut -f3)"
+        if err="$(write_sidecar "$epic" "$list")"; then
+          st_set '.epic = $e' --argjson e "${epic:-null}"; return 0
+        fi
+        retries=$((retries + 1))
+        [ "$retries" -ge 3 ] && { needs_owner null planning "$err"; halt "planning reported tickets that do not exist"; return 1; }
+        prompt="$err. Re-check the tracker and end with UNATTENDED-TICKETS again." ;;
+      ask)
+        local rec; rec="$(printf '%s' "$parsed" | cut -f4)"
+        if [ -n "$rec" ]; then prompt="Go with the recommended option: $rec. Continue."
+        else
+          res="$(decide_call planning "$TURN_TEXT")"; add_decide_cost
+          case "$res" in REPLY*) prompt="${res#REPLY	}" ;; *) prompt="Take the safest option and continue." ;; esac
+        fi ;;
+      blocked)
+        needs_owner null "$(printf '%s' "$parsed" | cut -f2)" "$(printf '%s' "$parsed" | cut -f3)"
+        halt "planning session is blocked"; return 1 ;;
+      *) prompt="This is the planning session. Build nothing. Find or file the tickets, then end with UNATTENDED-TICKETS." ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------- tickets ---
+
+# dependents_of <n> → 0 when a later ticket lists n in blocked_by
+has_dependents() {
+  [ "$(jq --argjson n "$1" '[.tickets[] | select(.blocked_by | index($n))] | length' "$STATE")" -gt 0 ]
+}
+
+# verify_done <n> <pr> → 0 when the PR is MERGED and the ticket closed;
+# else prints what is missing.
+verify_done() {
+  local n="$1" pr="$2" s branch
+  branch="$(pr_json "$pr" | jq -r '.headRefName // empty' 2>/dev/null)"
+  if ! printf '%s' "$branch" | grep -Eq "^[a-z]+/(GH-|#)?$n-"; then
+    printf 'PR #%s (branch %s) is not the PR for ticket #%s. The branch must be {type}/GH-%s-<description>.' "$pr" "${branch:-unknown}" "$n" "$n"; return 1
+  fi
+  s="$(pr_state "$pr")"
+  if [ "$s" != MERGED ]; then printf 'PR #%s is %s, not merged.' "$pr" "${s:-not found}"; return 1; fi
+  if ! issue_closed "$n"; then printf 'PR #%s is merged but ticket #%s is still open. Run QA against its acceptance criteria and close it.' "$pr" "$n"; return 1; fi
+  return 0
+}
+
+mark_done() { tk_str "$1" status "done"; tk_set "$1" pr "$2"; log "DONE ticket #$1 (PR #$2)"; }
+
+# blocked_outcome <n> → 2 (continue) when nothing depends on n, else halt (1)
+blocked_outcome() {
+  if has_dependents "$1"; then halt "ticket #$1 needs the owner and a later ticket depends on it"; return 1; fi
+  return 2
+}
+
+# approve <n> <design|merge> <pr> → sets PROMPT; returns 0 to continue,
+# 1 to halt.
+approve() {
+  local n="$1" kind="$2" pr="$3" js state draft head rex cmd last_sent refusals branch bound
+  js="$(pr_json "$pr")"
+  branch="$(printf '%s' "$js" | jq -r '.headRefName // empty')"
+  # The PR must be this ticket's PR, and a ticket keeps the first PR it got
+  # an approval for (security review of #7, H2).
+  if ! printf '%s' "$branch" | grep -Eq "^[a-z]+/(GH-|#)?$n-"; then
+    PROMPT="PR #$pr (branch ${branch:-unknown}) is not the PR for ticket #$n. Ask only for the approval of this ticket's own PR, on a branch {type}/GH-$n-<description>."
+    log "REFUSED approval: PR #$pr branch ${branch:-unknown} does not name ticket #$n"
+    return 0
+  fi
+  bound="$(tk_get "$n" bound_pr)"
+  if [ -n "$bound" ] && [ "$bound" != "$pr" ] && [ "$(pr_state "$bound")" != CLOSED ]; then
+    PROMPT="Ticket #$n already has PR #$bound. One ticket has one PR. Continue on PR #$bound."
+    log "REFUSED approval: ticket #$n is bound to PR #$bound, not #$pr"
+    return 0
+  fi
+  tk_set "$n" pr "$pr"
+  state="$(printf '%s' "$js" | jq -r '.state // empty')"
+  draft="$(printf '%s' "$js" | jq -r '.isDraft // false')"
+  head="$(printf '%s' "$js" | jq -r '.headRefOid // empty')"
+  rex="$(rex_sha "$pr")"
+  last_sent="$(tk_get "$n" last_sent)"
+  tk_str "$n" branch "$branch"
+
+  if [ "$kind" = merge ] && [ "$last_sent" = "merge:$pr" ] && [ "$state" = OPEN ]; then
+    refusals="$(tk_inc "$n" approve_refusals)"
+    log "REFUSAL ticket #$n PR #$pr: /approve-merge did not merge (cycle $refusals)"
+    if [ "$refusals" -ge 3 ]; then
+      needs_owner "$n" approve-refused "/approve-merge refused three times on PR #$pr"
+      halt "/approve-merge refused three times on PR #$pr"; return 1
+    fi
+  fi
+
+  if ! token_intact; then
+    needs_owner "$n" token-missing "the run token is missing or changed at an approval for PR #$pr"
+    halt "run token missing"; return 1
+  fi
+  if [ "$state" != OPEN ]; then PROMPT="PR #$pr is ${state:-not found}, not open. Check the PR and continue."; return 0; fi
+  if [ "$kind" = merge ] && [ "$draft" = true ]; then PROMPT="PR #$pr is a draft. Mark it ready for review, then ask again."; return 0; fi
+  if [ -z "$rex" ] || [ "$rex" != "$head" ]; then
+    PROMPT="Rex's approval marker for PR #$pr does not match HEAD $head. Run /code-review on PR #$pr, fix any findings, then ask again."
+    local mism; mism="$(tk_inc "$n" rex_mismatch)"
+    [ "$mism" -ge 3 ] && { needs_owner "$n" rex-mismatch "Rex marker did not match HEAD three times on PR #$pr"; halt "Rex marker did not match HEAD three times on PR #$pr"; return 1; }
+    return 0
+  fi
+  # The marker file alone is forgeable by the child. Also require Rex's
+  # posted review on the host naming this HEAD (security review of #7, M2).
+  if ! rex_posted "$pr" "$head"; then
+    PROMPT="No posted Rex review on PR #$pr names the reviewed commit $head. Run /code-review on PR #$pr, then ask again."
+    local nopost; nopost="$(tk_inc "$n" rex_mismatch)"
+    [ "$nopost" -ge 3 ] && { needs_owner "$n" rex-mismatch "no posted Rex review for HEAD three times on PR #$pr"; halt "no posted Rex review for HEAD on PR #$pr"; return 1; }
+    return 0
+  fi
+  if [ "$kind" = merge ] && ci_red "$pr"; then
+    local red; red="$(tk_inc "$n" ci_red)"
+    if [ "$red" -ge 2 ]; then needs_owner "$n" ci-red "CI was red at approval time twice on PR #$pr"; halt "CI red twice on PR #$pr"; return 1; fi
+    PROMPT="CI is red on PR #$pr. Fix the failing checks, push, get a delta review, then ask again."; return 0
+  fi
+
+  cmd="/approve-$kind $REPO#$pr"
+  if ! rehearse_pause "$cmd"; then halt "rehearsal stopped by the owner"; return 1; fi
+  record_approval "$n" "$pr" "$kind" "$head" "$rex" "$cmd" sent
+  tk_str "$n" last_sent "$kind:$pr"
+  tk_set "$n" bound_pr "$pr"
+  log "APPROVE ticket #$n: $cmd (head $head)"
+  PROMPT="$cmd"
+  APPROVED_SEND="$cmd"
+  return 0
+}
+
+# work_ticket <n> → 0 done, 1 halt, 2 needs-owner but continue
+work_ticket() {
+  local n="$1" sid mode end parsed kind missing=0 turns=0 res fp prev_fp="" noprog=0 h
+  local tcost status_line rex round
+  sid="$(tk_get "$n" session)"
+  if [ -z "$sid" ] || [ "$(tk_get "$n" fresh)" = true ]; then
+    sid="$(new_uuid)"; tk_str "$n" session "$sid"; tk_set "$n" fresh false; mode=new
+    PROMPT="$(ticket_prompt "$n")"
+  else
+    mode=resume
+    PROMPT="You were interrupted. Re-check the PR and ticket state for #$n and continue."
+  fi
+  tk_str "$n" status running; st_set '.current = $n' --argjson n "$n"
+  log "TICKET #$n start ($mode, session $sid)"
+
+  while :; do
+    [ -f "$STOP" ] && { halt "stopped by the owner (stop file)"; return 1; }
+    if ! token_intact; then needs_owner "$n" token "the run token was removed or changed during the run"; halt "run token removed or changed"; return 1; fi
+    if [ "$(sidecar_fingerprint)" != "$SIDECAR_FP" ]; then needs_owner "$n" sidecar "the sidecar changed during the run"; halt "sidecar changed during the run"; return 1; fi
+    tcost="$(tk_get "$n" cost)"
+    if fge "${tcost:-0}" "$MAX_TICKET_USD"; then needs_owner "$n" budget "ticket cost reached max_ticket_usd ($MAX_TICKET_USD)"; halt "ticket #$n cost ceiling"; return 1; fi
+    if fge "$(st '.cost_usd')" "$MAX_RUN_USD"; then halt "run cost reached max_run_usd ($MAX_RUN_USD)"; return 1; fi
+    turns=$((turns + 1))
+    [ "$turns" -gt "$MAX_TICKET_TURNS" ] && { needs_owner "$n" turns "ticket ran $MAX_TICKET_TURNS turns"; halt "ticket #$n turn ceiling"; return 1; }
+
+    child_turn "$sid" "$mode" "unattended:$PROJECT:$PRD_BASE:ticket-$n" "$PROMPT" "$STATE_DIR/logs/ticket-$n" "$n"
+    mode=resume
+    st_set '(.tickets[] | select(.n == $n)) |= (.turns += 1 | .cost = ((.cost // 0) + $c)) | .cost_usd = ((.cost_usd // 0) + $c)' \
+      --argjson n "$n" --argjson c "$TURN_COST"
+
+    if h="$(hook_block "$TURN_LOG")"; then needs_owner "$n" privileged "$h blocked a command"; halt "$h blocked a command"; return 1; fi
+
+    # Progress fingerprint: last line + PR head + PR state + ticket state.
+    local pr_now; pr_now="$(tk_get "$n" pr)"
+    fp="$(printf '%s|%s|%s|%s' "$(up_end_line "$TURN_TEXT")" \
+      "$( [ -n "$pr_now" ] && pr_json "$pr_now" | jq -r '"\(.headRefOid)/\(.state)"')" \
+      "$( [ -n "$pr_now" ] && rex_sha "$pr_now")" \
+      "$(issue_json "$n" | jq -r '.state // ""' 2>/dev/null)" | cksum)"
+    local progressed=1
+    [ "$fp" = "$prev_fp" ] && progressed=0
+    prev_fp="$fp"
+
+    if [ "$TURN_OK" != 1 ]; then
+      if [ "$progressed" = 1 ] && [ "$(tk_get "$n" retried)" != true ]; then
+        tk_set "$n" retried true
+        PROMPT="Your last turn stopped early ($TURN_REASON). Continue from where you stopped."
+        continue
+      fi
+      needs_owner "$n" turn-failed "turn failed: $TURN_REASON"; halt "ticket #$n turn failed"; return 1
+    fi
+    tk_set "$n" retried false
+
+    if [ "$progressed" = 0 ]; then noprog=$((noprog + 1)); else noprog=0; fi
+    if [ "$noprog" -ge 2 ]; then needs_owner "$n" no-progress "two turns in a row made no progress"; halt "no progress on ticket #$n"; return 1; fi
+
+    if status_line="$(up_status "$TURN_TEXT")"; then
+      rex="$(printf '%s' "$status_line" | cut -f1 | tr '[:upper:]' '[:lower:]')"
+      round="$(printf '%s' "$status_line" | cut -f2)"
+      case "$rex" in
+        changes*)
+          tk_set "$n" rex_rounds "${round:-0}"
+          if [ "${round:-0}" -ge 3 ] 2>/dev/null; then needs_owner "$n" rex-changes "Rex requested changes three times"; halt "Rex requested changes three times on ticket #$n"; return 1; fi ;;
+      esac
+    fi
+
+    end="$(up_end_line "$TURN_TEXT")"
+    if [ -z "$end" ] || ! up_is_last_line "$TURN_TEXT"; then
+      missing=$((missing + 1))
+      case "$missing" in
+        1) PROMPT="$NUDGE"; continue ;;
+        2) res="$(decide_call "ticket-$n" "$TURN_TEXT")"; add_decide_cost
+           case "$res" in
+             REPLY*) PROMPT="${res#REPLY	}"; continue ;;
+             HALT*) needs_owner "$n" no-endline "${res#HALT	}"; halt "ticket #$n gave no end line"; return 1 ;;
+             *) end="$res" ;;
+           esac ;;
+        *) needs_owner "$n" no-endline "the session gave no end line three times"; halt "ticket #$n gave no end line"; return 1 ;;
+      esac
+    else
+      missing=0
+    fi
+    tk_str "$n" last_line "$end"
+
+    parsed="$(up_parse "$end")"; kind="${parsed%%	*}"
+    case "$kind" in
+      ask)
+        local rec; rec="$(printf '%s' "$parsed" | cut -f4)"
+        if [ -n "$rec" ]; then PROMPT="Go with the recommended option: $rec. Continue."
+        else
+          res="$(decide_call "ticket-$n" "$TURN_TEXT")"; add_decide_cost
+          case "$res" in
+            REPLY*) PROMPT="${res#REPLY	}" ;;
+            HALT*) needs_owner "$n" ask "${res#HALT	}"; halt "ticket #$n question needs the owner"; return 1 ;;
+            *) PROMPT="Take the recommended or safest option and continue." ;;
+          esac
+        fi ;;
+      approve)
+        approve "$n" "$(printf '%s' "$parsed" | cut -f2)" "$(printf '%s' "$parsed" | cut -f3)" || return 1 ;;
+      next|done)
+        local t p msg
+        if [ "$kind" = next ]; then t="$(printf '%s' "$parsed" | cut -f2)"; p="$(printf '%s' "$parsed" | cut -f3)"
+        else t="$n"; p="$(tk_get "$n" pr)"; fi
+        if [ "$t" != "$n" ]; then PROMPT="This session is for ticket #$n only. Finish #$n, then end with UNATTENDED-NEXT: ticket=$n done pr=<p>."; continue; fi
+        [ -z "$p" ] && p="$(find_ticket_pr "$n")"
+        if [ -z "$p" ]; then PROMPT="No PR is recorded for ticket #$n. Name it with UNATTENDED-NEXT: ticket=$n done pr=<p>."; continue; fi
+        local lsent; lsent="$(tk_get "$n" last_sent)"
+        if msg="$(verify_done "$n" "$p")"; then
+          [ "$lsent" = "merge:$p" ] && record_approval "$n" "$p" merge-outcome "" "" "" merged
+          mark_done "$n" "$p"; return 0
+        fi
+        PROMPT="$msg Then end with UNATTENDED-NEXT: ticket=$n done pr=$p." ;;
+      blocked)
+        local code detail
+        code="$(printf '%s' "$parsed" | cut -f2)"; detail="$(printf '%s' "$parsed" | cut -f3)"
+        needs_owner "$n" "$code" "$detail"; tk_str "$n" status needs_owner
+        blocked_outcome "$n"; return $? ;;
+      tickets)
+        PROMPT="This is the ticket session for #$n. Work the ticket, then end with an UNATTENDED- line for it." ;;
+      *)
+        PROMPT="$NUDGE" ;;
+    esac
+  done
+}
+
+# reconcile — trust the tracker and GitHub over state.json (PRD US-7).
+reconcile() {
+  local n status pr s
+  for n in $(st '.tickets[].n'); do
+    status="$(tk_get "$n" status)"
+    [ "$status" = "done" ] && continue
+    pr="$(tk_get "$n" pr)"; [ -z "$pr" ] && pr="$(find_ticket_pr "$n")"
+    [ -n "$pr" ] && tk_set "$n" pr "$pr"
+    if issue_closed "$n"; then
+      if [ -z "$pr" ] || [ "$(pr_state "$pr")" = MERGED ]; then
+        tk_str "$n" status "done"; log "RECONCILE #$n is closed${pr:+ with PR #$pr merged}: done"; continue
+      fi
+    fi
+    if [ "$RESUME" = 1 ] && [ "$status" = needs_owner ]; then tk_str "$n" status pending; status=pending; fi
+    if [ "$status" = running ] || [ "$status" = pending ]; then
+      s=""; [ -n "$pr" ] && s="$(pr_state "$pr")"
+      # OPEN or MERGED (ticket still open: QA and closing are left) resume the
+      # ticket's own session, so it never opens a second PR. No PR, or a
+      # closed unmerged one, starts fresh.
+      if [ "$status" = running ]; then
+        if [ "$s" = OPEN ] || [ "$s" = MERGED ]; then log "RECONCILE #$n running with PR #$pr $s: resume session"
+        else tk_set "$n" fresh true; log "RECONCILE #$n running with no open PR: fresh session"; fi
+      fi
+    fi
+  done
+}
+
+# ----------------------------------------------------------------- summary ---
+
+write_summary() {
+  local halted
+  halted="$(st '.halted // empty')"
+  {
+    printf '# Unattended run summary\n\n'
+    printf -- '- PRD: `%s`\n- Project: %s (`%s`)\n- Run: `%s`, started by `%s`\n' "$PRD" "$PROJECT" "$REPO" "$RUN_ID" "$STARTED_BY"
+    printf -- '- Epic: %s\n- Total cost: %s USD\n' "$(st '.epic // "none"')" "$(st '.cost_usd // 0')"
+    printf -- '- Result: %s\n\n' "${halted:+halted: $halted}${halted:-done}"
+    printf '## Tickets\n\n| Ticket | Title | Status | Branch | PR | Turns | Cost USD | Rex rounds |\n|---|---|---|---|---|---|---|---|\n'
+    jq -r --arg repo "$REPO" '.tickets[] | "| #\(.n) | \(.title // "") | \(.status) | \(.branch // "") | \(if .pr then "[#\(.pr)](https://github.com/\($repo)/pull/\(.pr))" else "" end) | \(.turns // 0) | \(.cost // 0) | \(.rex_rounds // 0) |"' "$STATE"
+    printf '\n## Needs owner\n\n'
+    if [ "$(st '.needs_owner | length')" = 0 ]; then printf 'None.\n'
+    else jq -r '.needs_owner[] | "- \(if .ticket then "#\(.ticket)" else "run" end) `\(.code)`: \(.detail) (\(.at))"' "$STATE"; fi
+    if [ -n "$halted" ]; then
+      printf '\n## Halt reason\n\n%s\n\n## Resume\n\n```bash\n/unattended-plan %s --resume\n```\n' "$halted" "$PRD"
+    fi
+  } > "$SUMMARY"
+  log "SUMMARY: $SUMMARY"
+}
+
+# ---------------------------------------------------------------- commands ---
+
+cmd_status() {
+  if [ ! -f "$STATE" ]; then echo "No run state for $SLUG ($STATE_DIR)."; exit 0; fi
+  local holder=""; [ -f "$LOCK" ] && holder="$(cat "$LOCK")"
+  printf 'Run: %s  PRD: %s\n' "$(st '.run_id')" "$PRD"
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then printf 'Supervisor: running (PID %s)\n' "$holder"; else printf 'Supervisor: not running\n'; fi
+  printf 'Halted: %s\nCost: %s USD\nCurrent: %s\n' "$(st '.halted // "no"')" "$(st '.cost_usd // 0')" "$(st '.current // "none"')"
+  jq -r '.tickets[] | "  #\(.n)  \(.status)\(if .pr then "  PR #\(.pr)" else "" end)  turns=\(.turns // 0)  cost=\(.cost // 0)  \(.title // "")"' "$STATE"
+  jq -r '.needs_owner[]? | "  needs-owner \(if .ticket then "#\(.ticket)" else "run" end) \(.code): \(.detail)"' "$STATE"
+  printf 'Log: %s\n' "$SVLOG"
+}
+
+cmd_dry_run() {
+  echo "== Unattended Mode dry run (no model runs, nothing is written) =="
+  echo "PRD:       $PRD"
+  echo "Project:   $PROJECT ($REPO)"
+  echo "Workspace: ${WORKSPACE:-none}"
+  echo "State dir: $STATE_DIR"
+  echo "Sidecar:   $SIDECAR"
+  if [ ! -f "$SIDECAR" ]; then
+    echo
+    echo "No sidecar yet. The supervisor would first run the planning session:"
+    echo "  cd $OPS && $CLAUDE_BIN -p <templates/unattended-planning-session.md> --session-id <uuid> \\"
+    echo "    --name unattended:$PROJECT:$PRD_BASE:planning --output-format stream-json --verbose \\"
+    echo "    --append-system-prompt <templates/unattended-child.md> --permission-mode acceptEdits \\"
+    echo "    --permission-prompts none --allowedTools $CHILD_ALLOWED_TOOLS \\"
+    echo "    --disallowedTools $CHILD_DISALLOWED_TOOLS --max-budget-usd 15"
+    echo "Then it verifies each UNATTENDED-TICKETS number with tracker_view and writes the sidecar."
+    return 0
+  fi
+  load_config
+  echo "Config:    max_turn_usd=$MAX_TURN_USD max_ticket_usd=$MAX_TICKET_USD max_run_usd=$MAX_RUN_USD turn_timeout_s=$TURN_TIMEOUT_S"
+  echo
+  echo "Ticket plan (strict series):"
+  jq -r --arg f ",$TICKET_FILTER," '.tickets[] | . as $x | select($f == ",," or ($f | contains(",\($x.n),"))) | "  #\(.n)  \(.title // "")\(if (.blocked_by | length) > 0 then "  blocked by \(.blocked_by | map("#\(.)") | join(", "))" else "" end)\(if .owner_only then "  [owner_only: skipped]" else "" end)\(if .ui then "  [ui]" else "" end)"' "$SIDECAR"
+  echo
+  echo "Per ticket, in order:"
+  echo "  env -u ${SCRUB_VARS// / -u } \\"
+  echo "    APEXYARD_UNATTENDED_SUPERVISED=1 APEXYARD_APPROVAL_PROXY=\"unattended-plan run=<id> prd=$PRD ticket=<n> started_by=<owner>\" \\"
+  echo "    timeout -s INT --kill-after=120 $TURN_TIMEOUT_S $CLAUDE_BIN -p <ticket prompt> --session-id <uuid> (then --resume <uuid>) \\"
+  echo "    --name unattended:$PROJECT:$PRD_BASE:ticket-<n> --output-format stream-json --verbose \\"
+  echo "    --append-system-prompt <templates/unattended-child.md> --permission-mode acceptEdits --permission-prompts none \\"
+  echo "    --allowedTools $CHILD_ALLOWED_TOOLS --disallowedTools $CHILD_DISALLOWED_TOOLS --max-budget-usd $MAX_TURN_USD${WORKSPACE:+ --add-dir $WORKSPACE}"
+  echo "  gh pr view <pr> --repo $REPO --json number,state,isDraft,headRefOid,headRefName,url"
+  echo "  gh pr checks <pr> --repo $REPO --json bucket"
+  echo "  tracker_view <n> $REPO"
+  echo
+  echo "Replies the supervisor sends:"
+  echo "  UNATTENDED-ASK ... | recommended: <x>   -> Go with the recommended option: <x>. Continue."
+  echo "  UNATTENDED-ASK (no recommendation)      -> the decide call's reply ($CLAUDE_BIN -p --json-schema ... --max-budget-usd 1 --allowedTools Read)"
+  echo "  UNATTENDED-APPROVE: design pr=<p>       -> /approve-design $REPO#<p>   (PR open, Rex marker == HEAD, token present)"
+  echo "  UNATTENDED-APPROVE: merge pr=<p>        -> /approve-merge $REPO#<p>    (open, not draft, CI not red, Rex == HEAD, token present)"
+  echo "  UNATTENDED-NEXT: ticket=<n> done pr=<p> -> verify PR MERGED + ticket closed, then a fresh session for the next ticket"
+  echo "  UNATTENDED-BLOCKED: <code> <detail>     -> needs-owner item; continue only if no later ticket depends on it"
+  echo "  missing end line                        -> \"$NUDGE\" then the decide call, then needs-owner"
+}
+
+init_state() {
+  mkdir -p "$STATE_DIR"
+  if [ ! -f "$STATE" ]; then
+    jq -n --arg run "$RUN_ID" --arg prd "$PRD" --arg project "$PROJECT" --arg repo "$REPO" \
+      --arg ws "$WORKSPACE" --arg by "$STARTED_BY" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{run_id:$run, prd:$prd, project:$project, repo:$repo, workspace:$ws, started_by:$by,
+        started_at:$at, epic:null, cost_usd:0, current:null, halted:null, planning:null,
+        tickets:[], needs_owner:[]}' > "$STATE"
+  else
+    st_set '.run_id = $run | .started_by = $by' --arg run "$RUN_ID" --arg by "$STARTED_BY"
+  fi
+}
+
+# merge the sidecar's ticket list into state, keeping recorded progress.
+merge_tickets() {
+  st_set '
+    $s[0] as $side
+    | ($side.tickets | map(. as $x | select($f == ",," or ($f | contains(",\($x.n),"))))) as $want
+    | .epic = ($side.epic // .epic)
+    | .tickets = [ $want[] as $t
+        | ((.tickets // [])[] | select(.n == $t.n)) // {status: "pending", session: null, pr: null,
+            branch: null, turns: 0, cost: 0, rex_rounds: 0, ci_red: 0, approve_refusals: 0, rex_mismatch: 0, bound_pr: null,
+            last_line: null, last_sent: null, retried: false, fresh: false}
+        | . + {n: $t.n, title: ($t.title // ""), blocked_by: ($t.blocked_by // []),
+               owner_only: ($t.owner_only // false), ui: ($t.ui // false)} ]' \
+    --slurpfile s "$SIDECAR" --arg f ",$TICKET_FILTER,"
+}
+
+cmd_run() {
+  if [ "${APEXYARD_UNATTENDED_SUPERVISED:-}" = 1 ]; then
+    echo "unattended-supervisor: refusing to start inside a supervised child session" >&2; exit 2
+  fi
+  [ -n "$REPO" ] || die "--repo is required for run"
+  local dep
+  for dep in jq gh timeout; do command -v "$dep" >/dev/null 2>&1 || die "missing dependency: $dep"; done
+  [ -f "$PRD" ] || die "PRD not found: $PRD"
+
+  if [ "$DRY_RUN" = 1 ]; then cmd_dry_run; exit 0; fi
+  command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "missing dependency: $CLAUDE_BIN"
+
+  RUN_ID="$(token_get run_id)"; STARTED_BY="$(token_get started_by)"
+  [ -n "$RUN_ID" ] || die "no run token at $TOKEN. Start the run with /unattended-plan."
+  [ -n "$STARTED_BY" ] || STARTED_BY=unknown
+
+  acquire_lock
+  trap 'release_lock' EXIT
+  trap 'log "signal received, stopping"; exit 1' INT TERM
+  rm -f "$STOP"
+  load_tracker_lib
+  # Read every template once, before any child runs: a child can write the
+  # ops root, so a later re-read would let it shape the next prompt (H1).
+  CHILD_RULES="$(strip_comment < "$LIB_ROOT/templates/unattended-child.md")"
+  TPL_PLANNING="$(strip_comment < "$LIB_ROOT/templates/unattended-planning-session.md")"
+  TPL_TICKET="$(strip_comment < "$LIB_ROOT/templates/unattended-ticket-session.md")"
+  TPL_GENERIC="$(strip_comment < "$LIB_ROOT/templates/unattended-ticket-generic.md")"
+  EXEC_PROMPT_TEXT=""
+  TOKEN_FP="$(token_fingerprint)"
+  init_state
+  if [ -n "$(st '.halted // empty')" ]; then
+    if [ "$RESUME" = 1 ]; then st_set '.halted = null'
+    else echo "Run halted earlier: $(st '.halted'). Use --resume." >&2; exit 1; fi
+  fi
+  log "START run=$RUN_ID prd=$PRD project=$PROJECT repo=$REPO resume=$RESUME plan_only=$PLAN_ONLY rehearse=$REHEARSE"
+
+  # Planning uses the sidecar's config when one exists, else the defaults.
+  if [ -f "$SIDECAR" ]; then load_config
+  else
+    MAX_TURN_USD=15; MAX_TICKET_USD=60; MAX_RUN_USD=300; TURN_TIMEOUT_S=5400
+    log "PLAN: no sidecar, running the planning session"
+    if ! run_planning; then write_summary; exit 1; fi
+    load_config
+  fi
+
+  if [ "$PLAN_ONLY" = 1 ]; then
+    log "PLAN-ONLY: stopping after the sidecar"; cat "$SIDECAR"; exit 0
+  fi
+
+  SIDECAR_FP="$(sidecar_fingerprint)"
+  if ! merge_tickets; then halt "could not merge the sidecar into the run state"; write_summary; exit 1; fi
+  if [ "$(st '.tickets | length')" = 0 ]; then halt "no tickets to work (check the sidecar and --tickets)"; write_summary; exit 1; fi
+  reconcile
+
+  local n rc dep_ok d
+  for n in $(st '.tickets[].n'); do
+    case "$(tk_get "$n" status)" in done|skipped) continue ;; esac
+    if [ "$(tk_get "$n" owner_only)" = true ]; then
+      tk_str "$n" status skipped; needs_owner "$n" owner_only "the sidecar marks #$n owner_only"
+      if has_dependents "$n"; then halt "ticket #$n is owner_only and a later ticket depends on it"; break; fi
+      continue
+    fi
+    dep_ok=1
+    for d in $(jq -r --argjson n "$n" '.tickets[] | select(.n == $n) | .blocked_by[]?' "$STATE"); do
+      [ "$(tk_get "$d" status)" = "done" ] || issue_closed "$d" || dep_ok=0
+    done
+    if [ "$dep_ok" = 0 ]; then halt "ticket #$n depends on a ticket that is not done"; break; fi
+    work_ticket "$n"; rc=$?
+    [ "$rc" = 1 ] && break
+  done
+
+  [ -z "$(st '.halted // empty')" ] && st_set '.current = null'
+  write_summary
+  if [ -n "$(st '.halted // empty')" ]; then exit 1; fi
+  log "RUN DONE"
+  exit 0
+}
+
+case "$CMD" in
+  status) cmd_status ;;
+  run) cmd_run ;;
+esac

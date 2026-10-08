@@ -81,6 +81,14 @@ The design has these parts:
 - Anyone with disk access can write a run token. The human-only command, the
   audit log, and the refusal inside a supervised child are the backstops. The
   framework takes the same position on review markers.
+- A child session runs as the same OS user as the supervisor, so it can write
+  the run token, the review markers, and the sidecar. No file-based control
+  can stop that without a hook change, which this design excludes. The
+  supervisor detects tampering instead. It halts when the token or the
+  sidecar changes during a run. It requires a posted Rex review for HEAD. It
+  sends a slash command only when it built that command itself. The PR #7
+  security review found these gaps. The owner accepts the residual risk by
+  merging that PR.
 - `/unattended-plan` joins the human-only list in
   `test_skill_invocability_gates.sh`. Its invocation is the owner's delegation
   of approval for that run.

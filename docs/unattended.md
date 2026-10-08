@@ -10,9 +10,8 @@ The workflow does not change. Gates, hooks, review markers, and Rex do not
 change. There is no per-project setting. The command authorizes one run only.
 The decision record is [AgDR-0222](agdr/AgDR-0222-unattended-supervisor-as-owner-proxy.md).
 
-> **Status**: this page describes the design. The supervisor ships in a later
-> PR. Sections marked *(ships with the supervisor)* describe behaviour that is
-> not available yet.
+> **Status**: the supervisor and the command are available. The `proxy=` audit
+> line in the CEO marker ships with the approval-audit change (#4).
 
 ## Terms
 
@@ -45,7 +44,7 @@ The decision record is [AgDR-0222](agdr/AgDR-0222-unattended-supervisor-as-owner
 Tickets always run in series. One ticket is one session, one branch, and one
 PR. The supervisor never starts ticket N+1 while ticket N's PR is open.
 
-## Plan *(ships with the supervisor)*
+## Plan
 
 ```bash
 /unattended-plan <prd-path> --plan-only
@@ -55,7 +54,7 @@ This runs the planning session and writes `<prd-basename>.unattended.json`
 next to the PRD. Edit the sidecar to reorder tickets, remove tickets, or mark a
 ticket `owner_only`. An existing sidecar always wins.
 
-## Run *(ships with the supervisor)*
+## Run
 
 ```bash
 /unattended-plan <prd-path> --dry-run     # print the plan and every call, run no model
@@ -73,14 +72,19 @@ Other flags:
 | `--stop` | Remove the run token and stop after the current turn. |
 | `--resume` | Reconcile with the tracker and continue at the first ticket that is not done. |
 
-## Watch *(ships with the supervisor)*
+`--rehearse` pauses for a keypress before each approval, so it needs a
+terminal. Run it from a terminal with `bin/apexyard unattended-plan <prd>
+--rehearse`. Inside a Claude Code session, the skill prints that command.
+Press Enter to send the approval. Type `q` and Enter to stop the run.
+
+## Watch
 
 ```bash
 tail -f .claude/session/unattended/<prd-slug>/supervisor.log
 /unattended-plan <prd-path> --status
 ```
 
-## Stop and resume *(ships with the supervisor)*
+## Stop and resume
 
 `--stop` removes the run token and creates the stop file. The supervisor
 finishes the current turn, sends nothing more, and writes `summary.md`.
@@ -112,17 +116,25 @@ decide call. Then it records a needs-owner item.
 
 ### Approval checks
 
-Before it sends `/approve-design`, the supervisor checks that:
+Before it sends `/approve-design` or `/approve-merge`, the supervisor checks
+that:
 
-- the PR is open, and
-- Rex's marker matches the PR HEAD.
+- the PR's branch names the ticket (`{type}/GH-<n>-...`, `{type}/#<n>-...`,
+  or `{type}/<n>-...`),
+- the ticket has no other open PR that already got an approval,
+- the PR is open,
+- Rex's marker matches the PR HEAD,
+- a Rex review posted on the PR names that HEAD in its "Reviewed commit"
+  footer, and
+- the run token is the same file the run started with.
 
-Before it sends `/approve-merge`, the supervisor checks that:
+Before `/approve-merge` it also checks that the PR is not a draft and CI is
+not red.
 
-- the PR is open and not a draft,
-- CI is not red,
-- Rex's marker matches the PR HEAD, and
-- the run token exists.
+The supervisor sends a slash command only when it built the command after
+these checks. Any other reply that starts with `/` goes to the child as plain
+text. A project whose branches use another ticket-ID prefix fails the branch
+check, and the run halts with no progress.
 
 ## Stop conditions
 
@@ -157,9 +169,30 @@ Before it sends `/approve-merge`, the supervisor checks that:
 | `config.max_ticket_usd` | 60 | The cost ceiling for one ticket. |
 | `config.max_run_usd` | 300 | The cost ceiling for the run. |
 | `config.turn_timeout_s` | 5400 | The wall-clock limit for one child turn. |
-| `config.notify_webhook` | empty | A URL that receives a POST on halt, done, and each needs-owner item. |
+| `config.notify_webhook` | empty | A URL that receives a POST on halt, done, and each needs-owner item (ships with #5). |
+
+## Files
+
+Each run keeps its files in `.claude/session/unattended/<project>-<prd>/`:
+
+| File | Content |
+|---|---|
+| `run.token` | `run_id`, `prd`, `project`, `started_by`, `started_at`. |
+| `state.json` | The epic, each ticket's status, session, branch, PR, turns, and cost, the needs-owner items, and the halt reason. |
+| `lock` | The PID of the running supervisor. |
+| `stop` | Created by `--stop`. |
+| `approvals.jsonl` | One line per proxied approval. |
+| `supervisor.log` | One line per supervisor decision. |
+| `console.log` | The detached supervisor's output. |
+| `logs/planning/turn-<k>.jsonl`, `logs/ticket-<n>/turn-<k>.jsonl` | The full stream of each child turn. |
+| `summary.md` | The run summary. |
 
 ## Audit
+
+Each `approvals.jsonl` line holds `at`, `run`, `ticket`, `pr`, `kind`, `head`,
+`rex`, `command`, `result`, and `started_by`. The supervisor writes a line with
+`result: "sent"` when it sends an approval. It writes a `merge-outcome` line
+with `result: "merged"` after it verifies the merge.
 
 Each proxied merge leaves two records:
 
@@ -172,7 +205,17 @@ Each proxied merge leaves two records:
 - The supervisor runs on your machine, not in the cloud. A cloud routine cannot
   reach the local workspace, the markers, or a local stack.
 - The supervisor never enters credentials, creates accounts, or edits secrets.
-- Anyone with disk access can write a run token. The human-only command, the
-  audit log, and the refusal inside a supervised child are the backstops.
+- A child session runs as the same OS user as the supervisor. It can write
+  the state directory, the review markers, and the sidecar. The supervisor
+  cannot keep a secret from it. The supervisor therefore detects tampering
+  instead of preventing it:
+  - It halts when the run token disappears or changes during the run.
+  - It halts when the sidecar changes during the run.
+  - It requires a posted Rex review for HEAD, not only the marker file.
+  - It reads every template once, before the first child runs.
+  - It creates the state, the token, and the logs with mode `600`.
+- A model in an attended session can run `unattended-plan.sh` through Bash
+  and skip the human-only skill. AgDR-0222 accepts this. The merge gates,
+  the audit log, and `approvals.jsonl` still record every merge.
 - One mechanism is not documented: a slash command in a resumed `-p` turn.
   `--rehearse` verifies it on the first run.

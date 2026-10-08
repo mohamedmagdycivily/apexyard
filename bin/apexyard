@@ -8,6 +8,7 @@
 #
 # Usage:
 #   apexyard status [-b|--briefing]   # 4-line "where am I" briefing
+#   apexyard unattended-plan <prd> [flags]   # Unattended Mode (AgDR-0222)
 #   apexyard --help
 #
 # The script delegates to .claude/skills/status/briefing.sh inside the
@@ -52,6 +53,11 @@ Commands:
   status [-b|--briefing]   Compact "where am I" briefing — workspace, ticket,
                            branch, role. Defaults to --briefing today (the
                            full /status report runs inside Claude Code).
+  unattended-plan <prd> [--project <name>] [--plan-only] [--tickets 12,14]
+                  [--rehearse] [--dry-run] [--resume] [--stop] [--status]
+                           Start or control an Unattended Mode run for one
+                           PRD (docs/unattended.md). Run it from a terminal
+                           for --rehearse.
 
 Run from inside an apexyard fork or any of its workspace/<name>/ clones.
 EOF
@@ -90,6 +96,18 @@ case "$cmd" in
     esac
 
     exec bash "$helper"
+    ;;
+  unattended-plan)
+    if ! ops_root=$(find_ops_root); then
+      echo "apexyard: not inside an apexyard fork (no .apexyard-fork marker, and no onboarding.yaml + apexyard.projects.yaml found above $PWD)" >&2
+      exit 1
+    fi
+    helper="$ops_root/.claude/skills/unattended-plan/unattended-plan.sh"
+    if [ ! -f "$helper" ]; then
+      echo "apexyard: unattended-plan helper not found at $helper" >&2
+      exit 1
+    fi
+    exec bash "$helper" "$@"
     ;;
   *)
     echo "apexyard: unknown command '$cmd'" >&2
