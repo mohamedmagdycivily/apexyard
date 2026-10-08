@@ -39,6 +39,7 @@ printf '%s\t%s\t%s\t%s\n' "$key" "$mode" "$sid" "$(printf '%s' "$prompt" | tr '\
 printf '%s\t%s\n' "$key" "$argv" >> "$FAKE_DIR/argv.log"
 printf '%s\tsession_id=%s\tproxy=%s\tsupervised=%s\n' "$key" "${CLAUDE_CODE_SESSION_ID:-}" \
   "${APEXYARD_APPROVAL_PROXY:-}" "${APEXYARD_UNATTENDED_SUPERVISED:-}" >> "$FAKE_DIR/env.log"
+printf '%s' "$prompt" > "$FAKE_DIR/prompt.$key.$k"
 # Snapshot the tracker when a session starts, for the sequential assertion.
 [ "$mode" = new ] && fake_snapshot > "$FAKE_DIR/snap.$key"
 

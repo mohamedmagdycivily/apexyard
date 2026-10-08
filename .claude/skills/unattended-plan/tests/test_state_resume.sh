@@ -71,6 +71,13 @@ check "open-pr: ticket 13 starts only after 12 is merged and closed" 'grep -qx "
 check "open-pr: run done" '[ "$RC" = 0 ]' "$OUT"
 cleanup
 
+echo "== resume: merged PR with an open ticket resumes the session (no second PR)"
+setup; set_pr 101 MERGED "$SHA_A" feature/GH-12-signup
+seed_state '{"status":"running","session":"44444444-4444-4444-4444-444444444444","pr":101}'
+run --resume
+check "merged-open: resumes the recorded session" '[ "$(calls_for ticket_12 | head -1 | cut -f2-3)" = "resume	44444444-4444-4444-4444-444444444444" ]' "$(cat "$FAKE_DIR/calls.log" 2>/dev/null)"
+cleanup
+
 echo "== resume: running ticket with no PR starts a fresh session"
 setup
 seed_state '{"status":"running","session":"33333333-3333-3333-3333-333333333333"}'

@@ -217,6 +217,28 @@ check "dry-run: prints the child call and replies" 'printf "%s" "$OUT" | grep -q
 check "dry-run: writes no state" '[ ! -f "$STATE_DIR/state.json" ]'
 cleanup
 
+# --------------------------------------------------------------- ampersand --
+echo "== ampersand"
+ut_sandbox; set_issue 12 OPEN
+printf 'Run npm test && npm run lint before you push.\nUse A&B naming.\n' > "$SB/docs/exec.md"
+jq -n '{config:{execution_prompt:"exec.md", max_turn_usd:15, max_ticket_usd:60, max_run_usd:300, turn_timeout_s:60, notify_webhook:""}, epic:11, tickets:[{n:12, title:"Search & filter", blocked_by:[]}]}' > "$SB/docs/PRD-001-x.unattended.json"
+ut_token; run_scenario ampersand
+P="$FAKE_DIR/prompt.ticket_12.1"
+check "ampersand: title verbatim" 'grep -qF "#12: Search & filter" "$P"' "$(head -3 "$P")"
+check "ampersand: execution prompt verbatim" 'grep -qF "Run npm test && npm run lint before you push." "$P" && grep -qF "Use A&B naming." "$P"'
+check "ampersand: no placeholder leaked" '! grep -q "{{" "$P"'
+check "ampersand: execution prompt scoped to the ticket" 'grep -qF "This session covers only ticket #12." "$P"'
+check "ampersand: done" '[ "$RC" = 0 ]' "$OUT"
+cleanup
+
+# ---------------------------------------------------------------- wrong-pr --
+echo "== wrong-pr"
+ut_sandbox; set_issue 12 OPEN; ut_sidecar '[{"n":12,"title":"Sign-up","blocked_by":[]}]'; ut_token
+run_scenario wrong-pr
+check "wrong-pr: a merged PR of another ticket is refused" 'calls_for ticket_12 | sed -n 2p | grep -q "is not the PR for ticket #12"'
+check "wrong-pr: the right PR completes the ticket" '[ "$RC" = 0 ] && [ "$(state ".tickets[0].pr")" = 101 ]' "$OUT"
+cleanup
+
 # -------------------------------------------------------------- ask-no-rec --
 echo "== ask-no-rec"
 ut_sandbox; two_tickets '[]'; run_scenario ask-no-rec --tickets 12

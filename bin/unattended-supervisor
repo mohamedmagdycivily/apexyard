@@ -190,7 +190,11 @@ acquire_lock() {
     exit 3
   fi
   log "WARNING: reclaiming a stale lock from dead PID ${holder:-unknown}"
-  printf '%s\n' "$$" > "$LOCK"
+  rm -f "$LOCK"
+  if ! ( set -C; printf '%s\n' "$$" > "$LOCK" ) 2>/dev/null; then
+    echo "unattended-supervisor: another supervisor took the lock at $LOCK" >&2
+    exit 3
+  fi
 }
 
 release_lock() {
@@ -323,7 +327,9 @@ decide_call() {
 
 --- session text ---
 $(printf '%s' "$text" | tail -c 6000)"
-  out="$( cd "$OPS" && env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION \
+  local unset_args=() v
+  for v in $SCRUB_VARS; do unset_args+=(-u "$v"); done
+  out="$( cd "$OPS" && env "${unset_args[@]}" \
       timeout 300 "$CLAUDE_BIN" -p "$prompt" --output-format json --json-schema "$schema" \
       --max-budget-usd 1 --allowedTools Read --disallowedTools "Bash,Edit,Write,Agent,Skill" \
       --permission-prompts none < /dev/null 2>/dev/null )"
@@ -366,7 +372,9 @@ record_approval() { # <ticket> <pr> <kind> <head> <rex> <command> <result>
 
 fill() { # <text> KEY=VALUE... — replace {{KEY}} literally
   local text="$1" kv key val; shift
-  for kv in "$@"; do key="${kv%%=*}"; val="${kv#*=}"; text="${text//\{\{$key\}\}/$val}"; done
+  # Quote the pattern AND the replacement: with bash 5.2's patsub_replacement
+  # an unquoted & in the replacement expands to the matched text.
+  for kv in "$@"; do key="${kv%%=*}"; val="${kv#*=}"; text="${text//"{{$key}}"/"$val"}"; done
   printf '%s' "$text"
 }
 
@@ -543,7 +551,11 @@ has_dependents() {
 # verify_done <n> <pr> → 0 when the PR is MERGED and the ticket closed;
 # else prints what is missing.
 verify_done() {
-  local n="$1" pr="$2" s
+  local n="$1" pr="$2" s branch
+  branch="$(pr_json "$pr" | jq -r '.headRefName // empty' 2>/dev/null)"
+  if ! printf '%s' "$branch" | grep -Eq "^[a-z]+/(GH-|#)?$n-"; then
+    printf 'PR #%s (branch %s) is not the PR for ticket #%s. The branch must be {type}/GH-%s-<description>.' "$pr" "${branch:-unknown}" "$n" "$n"; return 1
+  fi
   s="$(pr_state "$pr")"
   if [ "$s" != MERGED ]; then printf 'PR #%s is %s, not merged.' "$pr" "${s:-not found}"; return 1; fi
   if ! issue_closed "$n"; then printf 'PR #%s is merged but ticket #%s is still open. Run QA against its acceptance criteria and close it.' "$pr" "$n"; return 1; fi
@@ -588,8 +600,8 @@ approve() {
   if [ "$kind" = merge ] && [ "$draft" = true ]; then PROMPT="PR #$pr is a draft. Mark it ready for review, then ask again."; return 0; fi
   if [ -z "$rex" ] || [ "$rex" != "$head" ]; then
     PROMPT="Rex's approval marker for PR #$pr does not match HEAD $head. Run /code-review on PR #$pr, fix any findings, then ask again."
-    refusals="$(tk_inc "$n" approve_refusals)"
-    [ "$refusals" -ge 3 ] && { needs_owner "$n" approve-refused "Rex marker did not match HEAD three times on PR #$pr"; halt "approval checks failed three times on PR #$pr"; return 1; }
+    local mism; mism="$(tk_inc "$n" rex_mismatch)"
+    [ "$mism" -ge 3 ] && { needs_owner "$n" rex-mismatch "Rex marker did not match HEAD three times on PR #$pr"; halt "Rex marker did not match HEAD three times on PR #$pr"; return 1; }
     return 0
   fi
   if [ "$kind" = merge ] && ci_red "$pr"; then
@@ -745,8 +757,13 @@ reconcile() {
     if [ "$RESUME" = 1 ] && [ "$status" = needs_owner ]; then tk_str "$n" status pending; status=pending; fi
     if [ "$status" = running ] || [ "$status" = pending ]; then
       s=""; [ -n "$pr" ] && s="$(pr_state "$pr")"
-      if [ "$status" = running ] && [ "$s" != OPEN ]; then tk_set "$n" fresh true; log "RECONCILE #$n running with no open PR: fresh session"; fi
-      [ "$status" = running ] && [ "$s" = OPEN ] && log "RECONCILE #$n running with open PR #$pr: resume session"
+      # OPEN or MERGED (ticket still open: QA and closing are left) resume the
+      # ticket's own session, so it never opens a second PR. No PR, or a
+      # closed unmerged one, starts fresh.
+      if [ "$status" = running ]; then
+        if [ "$s" = OPEN ] || [ "$s" = MERGED ]; then log "RECONCILE #$n running with PR #$pr $s: resume session"
+        else tk_set "$n" fresh true; log "RECONCILE #$n running with no open PR: fresh session"; fi
+      fi
     fi
   done
 }
@@ -852,7 +869,7 @@ merge_tickets() {
     | .epic = ($side.epic // .epic)
     | .tickets = [ $want[] as $t
         | ((.tickets // [])[] | select(.n == $t.n)) // {status: "pending", session: null, pr: null,
-            branch: null, turns: 0, cost: 0, rex_rounds: 0, ci_red: 0, approve_refusals: 0,
+            branch: null, turns: 0, cost: 0, rex_rounds: 0, ci_red: 0, approve_refusals: 0, rex_mismatch: 0,
             last_line: null, last_sent: null, retried: false, fresh: false}
         | . + {n: $t.n, title: ($t.title // ""), blocked_by: ($t.blocked_by // []),
                owner_only: ($t.owner_only // false), ui: ($t.ui // false)} ]' \

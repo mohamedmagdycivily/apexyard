@@ -53,8 +53,10 @@ set_issue() { # <n> <OPEN|CLOSED> [title] [body] [labels csv]
 
 issue_state() { jq -r .state "$FAKE_DIR/issues/$1.json"; }
 
+# The default branch maps PR 101 → ticket 12, 102 → 13 (PR - 89), the pairing
+# every scenario uses, so verify_done's branch check sees the right ticket.
 set_pr() { # <p> <OPEN|MERGED|CLOSED> <head sha> [branch] [draft]
-  jq -n --argjson p "$1" --arg s "$2" --arg h "$3" --arg b "${4:-feature/GH-$1-x}" --argjson d "${5:-false}" \
+  jq -n --argjson p "$1" --arg s "$2" --arg h "$3" --arg b "${4:-feature/GH-$(( $1 - 89 ))-x}" --argjson d "${5:-false}" \
     '{number:$p, state:$s, isDraft:$d, headRefOid:$h, headRefName:$b, url:"https://github.com/acme/widget/pull/\($p)"}' \
     > "$FAKE_DIR/prs/$1.json"
 }
