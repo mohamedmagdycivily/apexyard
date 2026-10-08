@@ -10,7 +10,7 @@
 # Usage:
 #   unattended-plan.sh <prd-path> [--project <name>] [--plan-only]
 #                      [--tickets 12,14] [--rehearse] [--dry-run]
-#                      [--resume] [--stop] [--status]
+#                      [--resume] [--stop] [--status] [--tmux]
 #
 # Test seams: UNATTENDED_OPS_ROOT (ops root), UNATTENDED_REGISTRY (registry
 # file), UNATTENDED_FOREGROUND=1 (run the supervisor in the foreground).
@@ -30,7 +30,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPS="${UNATTENDED_OPS_ROOT:-$(cd "$SELF_DIR/../../.." && pwd)}"
 SUPERVISOR="$(cd "$SELF_DIR/../../.." && pwd)/bin/unattended-supervisor"
 
-PRD="" PROJECT="" ACTION=run PASS=()
+PRD="" PROJECT="" ACTION=run PASS=() TMUX_WINDOW=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --project) PROJECT="${2:-}"; shift 2 ;;
@@ -40,6 +40,7 @@ while [ $# -gt 0 ]; do
     --dry-run) ACTION=dry-run; shift ;;
     --stop) ACTION=stop; shift ;;
     --status) ACTION=status; shift ;;
+    --tmux) TMUX_WINDOW=1; shift ;;
     -h|--help) sed -n '10,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unattended-plan: unknown flag: $1" >&2; exit 2 ;;
     *) if [ -z "$PRD" ]; then PRD="$1"; shift; else echo "unattended-plan: one PRD path only" >&2; exit 2; fi ;;
@@ -125,9 +126,18 @@ case "$ACTION" in
   status)
     exec "$SUPERVISOR" status --prd "$PRD" --project "$PROJECT" --ops-root "$OPS" ;;
   stop)
-    mkdir -p "$STATE_DIR"
+    mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
     rm -f "$TOKEN"
     : > "$STATE_DIR/stop"
+    # Verify both signals landed (security review of #7, A4). When they did
+    # not, stop the supervisor process itself.
+    if [ -f "$TOKEN" ] || [ ! -f "$STATE_DIR/stop" ]; then
+      echo "unattended-plan: could not remove the token or create the stop file in $STATE_DIR." >&2
+      if pid="$(live_pid)"; then
+        kill -TERM "$pid" 2>/dev/null && echo "Sent SIGTERM to the supervisor (PID $pid)." >&2
+      fi
+      exit 1
+    fi
     echo "Stop requested for $PROJECT / $(basename "$PRD")."
     echo "The run token is removed. The supervisor finishes its current turn, sends nothing more, and writes $STATE_DIR/summary.md."
     exit 0 ;;
@@ -150,7 +160,7 @@ if [ "$ACTION" = rehearse ] && [ "${UNATTENDED_FOREGROUND:-}" != 1 ] && ! { [ -t
   exit 0
 fi
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
 started_by="${CLAUDE_CODE_SESSION_ID:-$(tty 2>/dev/null | grep -v 'not a tty' || echo "${USER:-unknown}@$(hostname 2>/dev/null)")}"
 tmp="$TOKEN.tmp.$$"
@@ -192,4 +202,11 @@ echo
 echo "Watch:  tail -f '$STATE_DIR/supervisor.log'"
 echo "Status: /unattended-plan '$PRD' --status"
 echo "Stop:   /unattended-plan '$PRD' --stop"
+if [ "$TMUX_WINDOW" = 1 ]; then
+  if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+    tmux new-window -d -n "unattended" "tail -f '$STATE_DIR/supervisor.log'" && echo "Opened tmux window 'unattended' with the log."
+  else
+    echo "--tmux: not inside tmux, no window opened."
+  fi
+fi
 echo "You can close this session now."
