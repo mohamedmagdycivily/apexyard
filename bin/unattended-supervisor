@@ -198,7 +198,9 @@ needs_owner() { # <ticket|null> <code> <detail>
   st_set '.needs_owner += [{ticket: $t, code: $c, detail: $d, at: $at}]' \
     --argjson t "${t:-null}" --arg c "$code" --arg d "$detail" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   log "NEEDS-OWNER ticket=${t:-none} code=$code detail=$detail"
-  notify needs_owner "${t:-}" "${t:+#$t }$code: $detail"
+  # Run-level items (planning) pass the literal "null": notify gets "".
+  [ "$t" = null ] && t=""
+  notify needs_owner "$t" "${t:+#$t }$code: $detail"
 }
 
 # notify <halt|done|needs_owner> <ticket|""> <message> — tell the owner who
@@ -219,7 +221,7 @@ notify() {
     esac
     body="$(jq -cn --arg e "$event" --arg run "${RUN_ID:-}" --arg prd "$PRD" --arg p "$PROJECT" \
       --arg t "$ticket" --arg m "$msg" --arg s "$SUMMARY" \
-      '{event:$e, run:$run, prd:$prd, project:$p, ticket:(if $t == "" then null else ($t | tonumber) end), message:$m, summary:$s}')"
+      '{event:$e, run:$run, prd:$prd, project:$p, ticket:($t | tonumber? // null), message:$m, summary:$s}')"
     curl -fsS -m 10 -X POST -H 'Content-Type: application/json' --data "$body" "$NOTIFY_WEBHOOK" >/dev/null 2>&1 \
       || log "WARNING: notify_webhook POST failed"
   fi
@@ -670,7 +672,8 @@ approve() {
   # itself (security review of #7, A5).
   local head_repo
   head_repo="$(printf '%s' "$js" | jq -r '"\(.headRepositoryOwner.login // "")/\(.headRepository.name // "")"')"
-  if [ "$head_repo" != "$REPO" ]; then
+  # GitHub owner and repo names are case-insensitive.
+  if [ "$(printf '%s' "$head_repo" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" ]; then
     PROMPT="PR #$pr comes from $head_repo, not $REPO. Push the branch to $REPO and ask for this ticket's own PR."
     log "REFUSED approval: PR #$pr head repository $head_repo is not $REPO"
     return 0

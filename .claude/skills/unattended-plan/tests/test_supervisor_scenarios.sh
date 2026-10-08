@@ -320,6 +320,24 @@ run_scenario happy
 check "notify: a failing webhook never fails the run" '[ "$RC" = 0 ] && grep -q "notify_webhook POST failed" "$STATE_DIR/supervisor.log"' "$OUT"
 cleanup
 
+ut_sandbox; ut_token
+DISPLAY=:99 run_scenario planning-blocked --plan-only
+check "notify: a run-level item has no #null in the desktop text" 'grep -q "account: the tracker needs a paid plan" "$FAKE_DIR/notify.log" && ! grep -q "#null" "$FAKE_DIR/notify.log"' "$(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
+check "notify: run-level item recorded with ticket null" '[ "$(state ".needs_owner[0].ticket")" = null ] && [ "$RC" = 1 ]' "$OUT"
+cleanup
+# A run-level item after the sidecar exists (token removed between tickets)
+# reaches the webhook with ticket null and a complete JSON body.
+ut_sandbox; two_tickets '[]'
+jq '.config.notify_webhook = "https://hooks.example.test/x"' "$SB/docs/PRD-001-x.unattended.json" > "$SB/t" && mv "$SB/t" "$SB/docs/PRD-001-x.unattended.json"
+run_scenario blocked-independent
+check "notify: webhook body is complete JSON" 'grep -q "\"event\":\"needs_owner\".*\"ticket\":12" "$FAKE_DIR/curl.log" && ! grep -q -- "--data  " "$FAKE_DIR/curl.log"' "$(cat "$FAKE_DIR/curl.log" 2>/dev/null)"
+cleanup
+ut_sandbox; two_tickets '[]'
+jq '.config.notify_webhook = "https://hooks.example.test/x"' "$SB/docs/PRD-001-x.unattended.json" > "$SB/t" && mv "$SB/t" "$SB/docs/PRD-001-x.unattended.json"
+run_scenario owner-token-gone
+check "notify: run-level webhook payload has ticket null" 'grep -q "\"event\":\"halt\"" "$FAKE_DIR/curl.log" && grep "\"ticket\":null" "$FAKE_DIR/curl.log" | grep -q "\"event\":\"halt\""' "$(cat "$FAKE_DIR/curl.log" 2>/dev/null)"
+cleanup
+
 # ------------------------------------------------------------ summary layout --
 echo "== summary layout"
 ut_sandbox; two_tickets '[12]'; run_scenario blocked-dependent

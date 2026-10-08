@@ -146,8 +146,10 @@ needs-owner item:
 - It sends a desktop notification with `notify-send` when `DISPLAY` or
   `WAYLAND_DISPLAY` is set.
 - It sends a JSON POST to `config.notify_webhook` when the sidecar sets an
-  `http` or `https` URL. The body holds `event`, `run`, `prd`, `project`,
-  `ticket`, `message`, and `summary`.
+  `http` or `https` URL. Use `https`: the body carries the PRD path and the
+  needs-owner detail. The body holds `event`, `run`, `prd`, `project`,
+  `ticket`, `message`, and `summary`. `ticket` is `null` for a run-level
+  item, such as one from the planning session.
 - A failed notification is logged and never stops the run.
 
 ## The summary
