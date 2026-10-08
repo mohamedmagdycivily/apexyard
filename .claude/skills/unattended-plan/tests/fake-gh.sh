@@ -19,5 +19,16 @@ case "$sub" in
     if [ -f "$f" ]; then cat "$f"; grep -q '"fail"' "$f" && exit 1; else echo '[]'; fi ;;
   "pr list")
     if ls "$FAKE_DIR"/prs/*.json >/dev/null 2>&1; then jq -s '.' "$FAKE_DIR"/prs/*.json; else echo '[]'; fi ;;
-  *) exit 0 ;;
+  "repo view")
+    # --json defaultBranchRef --jq .defaultBranchRef.name
+    echo "${FAKE_DEFAULT_BRANCH:-main}" ;;
+  "repo clone")
+    # gh repo clone <repo> <dir>: make an empty git clone stand-in.
+    [ "${FAKE_CLONE_FAIL:-0}" = 1 ] && exit 1
+    mkdir -p "$4" && git -C "$4" init -q && echo "$3" > "$FAKE_DIR/cloned" ;;
+  *)
+    case "$*" in
+      "api repos/"*"/branches"*) echo "${FAKE_BRANCHES:-1}" ;;
+    esac
+    exit 0 ;;
 esac

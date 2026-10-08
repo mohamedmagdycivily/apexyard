@@ -108,6 +108,60 @@ check "bad-number: unknown ticket sent back" 'calls_for planning | sed -n 2p | g
 check "bad-number: second report accepted" '[ "$RC" = 0 ] && [ "$(jq -c "[.tickets[].n]" "$SB/docs/PRD-001-x.unattended.json")" = "[12]" ]' "$OUT"
 cleanup
 
+# ------------------------------------------------------- #11: one command --
+echo "== planning-groups"
+ut_sandbox; ut_token
+set_issue 11 OPEN "[Feature] Widget MVP (PRD-001 epic)"
+set_issue 12 OPEN "[Feature] Sub-epic 1 of 2: Foundation"
+set_issue 13 OPEN "[Feature] Sign-up"
+set_issue 14 OPEN "[Feature] Payments group" "" "epic"
+set_issue 16 OPEN "[Feature] Search"
+run_scenario planning-groups --plan-only
+check "groups: epic and sub-epics dropped, stories kept" '[ "$(jq -c "[.tickets[].n]" "$SB/docs/PRD-001-x.unattended.json")" = "[13,16]" ]' "$OUT"
+check "groups: each drop is logged" '[ "$(grep -c "is an epic or sub-epic, dropped" "$STATE_DIR/supervisor.log")" = 3 ]'
+cleanup
+
+echo "== execution prompt by convention"
+ut_sandbox; two_tickets '[]'
+printf 'PARENT-PROMPT for ticket {{TICKET}} on {{BASE}}\n' > "$SB/execution-prompt-unattended.md"
+FAKE_DEFAULT_BRANCH=master run_scenario ampersand --tickets 12
+P="$FAKE_DIR/prompt.ticket_12.1"
+check "prompt: found in the PRD's parent dir" 'grep -qF "PARENT-PROMPT for ticket 12 on master" "$P"' "$(head -20 "$P")"
+check "prompt: discovery logged" 'grep -q "PROMPT: using $SB/execution-prompt-unattended.md (found by convention)" "$STATE_DIR/supervisor.log"'
+check "base: ticket prompt names the default branch" 'grep -qF "Start from an updated \`master\` (the default branch)" "$P"'
+check "base: child rules name the default branch" 'grep "^ticket_12" "$FAKE_DIR/argv.log" | head -1 | grep -qF "updated \`master\` (the repo" '
+cleanup
+ut_sandbox; two_tickets '[]'
+printf 'PARENT-PROMPT\n' > "$SB/execution-prompt-unattended.md"
+printf 'PRD-DIR-PROMPT\n' > "$SB/docs/execution-prompt-unattended.md"
+run_scenario ampersand --tickets 12
+check "prompt: the PRD's own dir wins over its parent" 'grep -q "PRD-DIR-PROMPT" "$FAKE_DIR/prompt.ticket_12.1" && ! grep -q "PARENT-PROMPT" "$FAKE_DIR/prompt.ticket_12.1"'
+cleanup
+ut_sandbox; set_issue 12 OPEN
+printf 'CONVENTION-PROMPT\n' > "$SB/docs/execution-prompt-unattended.md"
+printf 'SIDECAR-PROMPT\n' > "$SB/docs/mine.md"
+jq -n '{config:{execution_prompt:"mine.md", max_turn_usd:15, max_ticket_usd:60, max_run_usd:300, turn_timeout_s:60, notify_webhook:""}, epic:11, tickets:[{n:12, title:"Sign-up", blocked_by:[]}]}' > "$SB/docs/PRD-001-x.unattended.json"
+ut_token; run_scenario ampersand
+check "prompt: the sidecar's execution_prompt wins over the convention" 'grep -q "SIDECAR-PROMPT" "$FAKE_DIR/prompt.ticket_12.1" && ! grep -q "CONVENTION-PROMPT" "$FAKE_DIR/prompt.ticket_12.1"'
+cleanup
+ut_sandbox; two_tickets '[]'; run_scenario ampersand --tickets 12
+check "prompt: no file anywhere falls back to the generic prompt" 'grep -q "Work the ticket" "$FAKE_DIR/prompt.ticket_12.1" && grep -q "PROMPT: no execution prompt" "$STATE_DIR/supervisor.log"'
+cleanup
+
+echo "== workspace preflight"
+ut_sandbox; two_tickets '[]'
+FAKE_BRANCHES=0 run_scenario happy --tickets 12 --workspace "$SB/ws"
+check "empty repo: halts before any ticket with the fix named" '[ "$RC" = 1 ] && [ ! -s "$FAKE_DIR/calls.log" ] && state ".needs_owner[0].detail" | grep -q "Push one initial commit"' "$OUT"
+cleanup
+ut_sandbox; two_tickets '[]'; mkdir -p "$SB/ws"; echo x > "$SB/ws/file"
+run_scenario happy --tickets 12 --workspace "$SB/ws"
+check "workspace: a non-clone directory halts" '[ "$RC" = 1 ] && state ".halted" | grep -q "workspace is not a clone"' "$OUT"
+cleanup
+ut_sandbox; two_tickets '[]'
+run_scenario happy --tickets 12 --workspace "$SB/ws"
+check "workspace: missing clone is cloned, then the ticket runs" '[ "$RC" = 0 ] && [ -d "$SB/ws/.git" ] && grep "^ticket_12" "$FAKE_DIR/argv.log" | head -1 | grep -qF -- "--add-dir $SB/ws"' "$OUT"
+cleanup
+
 # ---------------------------------------------------- existing sidecar wins --
 echo "== sidecar wins"
 ut_sandbox; two_tickets; run_scenario planning-files-tickets --plan-only

@@ -15,7 +15,7 @@ This session is for ticket #{{TICKET}} only.
 
 ## Constraints for this session
 
-- Start from an updated `main` in the workspace.
+- Start from an updated `{{BASE}}` (the default branch) in the workspace.
 - Run `/start-ticket {{REPO}}#{{TICKET}}`.
 - Create one branch `{type}/{TICKET-ID}-{description}` for ticket #{{TICKET}}.
 - Open one PR. Never open a second PR.

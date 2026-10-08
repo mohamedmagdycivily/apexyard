@@ -13,6 +13,25 @@ The decision record is [AgDR-0222](agdr/AgDR-0222-unattended-supervisor-as-owner
 > **Status**: available. The first real run must use `--rehearse` (see the
 > walkthrough).
 
+## Quick start
+
+```bash
+/unattended-plan <prd-file>
+```
+
+That is the whole command. The supervisor:
+
+1. resolves the project from the PRD path through the registry,
+2. runs a planning session that finds or files the PRD's story tickets (epics and
+   sub-epics are skipped), and writes the sidecar,
+3. uses `execution-prompt-unattended.md` from the PRD's directory or its parent
+   when the project has one, else a generic ticket prompt,
+4. clones the project workspace when it is missing, and
+5. works the tickets in series and proxies every approval.
+
+Optional: rehearse one ticket first from a terminal with `--rehearse --tickets
+<n>`. Everything below is reference.
+
 ## Terms
 
 | Term | Meaning |
@@ -244,7 +263,7 @@ check, and the run halts with no progress.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `config.execution_prompt` | empty | A prompt file that each ticket session receives first. |
+| `config.execution_prompt` | empty | A prompt file that each ticket session receives first. When empty, `execution-prompt-unattended.md` in the PRD's directory or its parent is used. `{{TICKET}}`, `{{REPO}}`, and `{{BASE}}` (the default branch) are filled in. |
 | `config.max_turn_usd` | 15 | The budget for one child turn. |
 | `config.max_ticket_usd` | 60 | The cost ceiling for one ticket. |
 | `config.max_run_usd` | 300 | The cost ceiling for the run. |

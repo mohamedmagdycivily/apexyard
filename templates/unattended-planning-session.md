@@ -27,6 +27,7 @@ tickets for one PRD. Build nothing.
 ## End the session
 
 End your last turn with this line. List the open story tickets in dependency
-order. Do not list the epic in `tickets=`.
+order. Do not list the epic or any sub-epic in `tickets=`: they group
+other tickets and are never worked on their own.
 
     UNATTENDED-TICKETS: epic=<n> tickets=<n1>,<n2>,...

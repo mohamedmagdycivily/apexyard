@@ -117,7 +117,7 @@ STATE_DIR="$(printf '%s\n' "$paths" | sed -n 's/^state_dir=//p')"
 SIDECAR="$(printf '%s\n' "$paths" | sed -n 's/^sidecar=//p')"
 TOKEN="$STATE_DIR/run.token"
 LOCK="$STATE_DIR/lock"
-SV_ARGS=(--prd "$PRD" --project "$PROJECT" --repo "$REPO" --ops-root "$OPS")
+SV_ARGS=(--prd "$PRD" --project "$PROJECT" --repo "$REPO" --ops-root "$OPS" --portfolio-root "$(cd "$(dirname "$REGISTRY")" && pwd)")
 [ -n "$WORKSPACE" ] && SV_ARGS+=(--workspace "$WORKSPACE")
 
 live_pid() { local p; p="$(cat "$LOCK" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null && printf '%s' "$p"; }

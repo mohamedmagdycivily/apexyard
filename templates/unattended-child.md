@@ -22,7 +22,7 @@ Read `.claude/rules/unattended-mode.md` now. Follow it for the whole session.
 ## One ticket, one branch, one PR
 
 - This session covers only the ticket the first prompt names.
-- Start from an updated `main`. Create one branch. Open one PR.
+- Start from an updated `{{BASE}}` (the repo's default branch). Create one branch. Open one PR.
 - Never open a second PR. Never use `/fan-out` across tickets. Never start
   another ticket.
 
