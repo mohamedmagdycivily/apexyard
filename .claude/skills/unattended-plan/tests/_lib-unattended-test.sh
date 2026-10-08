@@ -20,6 +20,10 @@ ut_sandbox() { # → sets SB, FAKE_DIR, OPS_DIR, PRD_FILE, STATE_DIR; exports PA
   local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   cp "$here/fake-gh.sh" "$SB/bin/gh"; chmod +x "$SB/bin/gh"
   export FAKE_DIR OPS_DIR
+  # Fake notify-send and curl record what the supervisor would send.
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/notify.log"\n' "$FAKE_DIR" > "$SB/bin/notify-send"
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/curl.log"\n' "$FAKE_DIR" > "$SB/bin/curl"
+  chmod +x "$SB/bin/notify-send" "$SB/bin/curl"
   export PATH="$SB/bin:$PATH"
   export UNATTENDED_CLAUDE_BIN="$here/fake-claude.sh"
   STATE_DIR="$OPS_DIR/.claude/session/unattended/widget-prd-001-x"
@@ -55,9 +59,13 @@ issue_state() { jq -r .state "$FAKE_DIR/issues/$1.json"; }
 
 # The default branch maps PR 101 → ticket 12, 102 → 13 (PR - 89), the pairing
 # every scenario uses, so verify_done's branch check sees the right ticket.
-set_pr() { # <p> <OPEN|MERGED|CLOSED> <head sha> [branch] [draft]
+set_pr() { # <p> <OPEN|MERGED|CLOSED> <head sha> [branch] [draft] [head owner/repo]
+  local hr="${6:-acme/widget}"
   jq -n --argjson p "$1" --arg s "$2" --arg h "$3" --arg b "${4:-feature/GH-$(( $1 - 89 ))-x}" --argjson d "${5:-false}" \
-    '{number:$p, state:$s, isDraft:$d, headRefOid:$h, headRefName:$b, url:"https://github.com/acme/widget/pull/\($p)"}' \
+    --arg ho "${hr%%/*}" --arg hn "${hr#*/}" \
+    '{number:$p, state:$s, isDraft:$d, headRefOid:$h, headRefName:$b,
+      headRepository:{name:$hn}, headRepositoryOwner:{login:$ho},
+      url:"https://github.com/acme/widget/pull/\($p)"}' \
     > "$FAKE_DIR/prs/$1.json"
 }
 
@@ -68,7 +76,7 @@ pr_head() { jq -r .headRefOid "$FAKE_DIR/prs/$1.json"; }
 rex_ok() { # <p> — Rex approved the PR's current head: marker + posted review
   local h; h="$(pr_head "$1")"
   printf '%s\n' "$h" > "$OPS_DIR/.claude/session/reviews/acme__widget__$1-rex.approved"
-  jq --arg h "$h" '.reviews = ((.reviews // []) + [{body: ("Verdict: APPROVED\n\nReviewed commit: " + $h)}])' \
+  jq --arg h "$h" '.reviews = ((.reviews // []) + [{body: ("**Verdict: APPROVED**\n\n📌 Reviewed commit: `" + $h + "`")}])' \
     "$FAKE_DIR/prs/$1.json" > "$FAKE_DIR/prs/$1.json.tmp" && mv "$FAKE_DIR/prs/$1.json.tmp" "$FAKE_DIR/prs/$1.json"
 }
 

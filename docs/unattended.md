@@ -10,8 +10,8 @@ The workflow does not change. Gates, hooks, review markers, and Rex do not
 change. There is no per-project setting. The command authorizes one run only.
 The decision record is [AgDR-0222](agdr/AgDR-0222-unattended-supervisor-as-owner-proxy.md).
 
-> **Status**: the supervisor, the command, and the approval audit are
-> available. Notifications ship with #5.
+> **Status**: available. The first real run must use `--rehearse` (see the
+> walkthrough).
 
 ## Terms
 
@@ -69,6 +69,7 @@ Other flags:
 | `--project <name>` | Use this registered project when the PRD path does not resolve one. |
 | `--tickets 12,14` | Work only these tickets. |
 | `--status` | Print the run state. |
+| `--tmux` | Open a tmux window with the log, when you run inside tmux. |
 | `--stop` | Remove the run token and stop after the current turn. |
 | `--resume` | Reconcile with the tracker and continue at the first ticket that is not done. |
 
@@ -83,6 +84,83 @@ Press Enter to send the approval. Type `q` and Enter to stop the run.
 tail -f .claude/session/unattended/<prd-slug>/supervisor.log
 /unattended-plan <prd-path> --status
 ```
+
+## Walkthrough: the first run of a PRD
+
+This walkthrough takes one PRD of a registered project from no tickets to a
+finished run. Each step names what to check before the next one.
+
+1. Plan the tickets. Check the sidecar that this writes next to the PRD.
+
+   ```bash
+   /unattended-plan docs/prds/PRD-003-search.md --plan-only
+   ```
+
+   - Each story of the PRD has one ticket. The epic is in `epic`.
+   - The order follows the `Blocked by #N` references.
+   - Edit the sidecar now to reorder tickets, remove tickets, mark a ticket
+     `owner_only`, or set `config.execution_prompt` and `config.notify_webhook`.
+2. Print the plan and every call. No model runs.
+
+   ```bash
+   /unattended-plan docs/prds/PRD-003-search.md --dry-run
+   ```
+
+3. Rehearse the first ticket from a terminal. Watch it through its first
+   approval.
+
+   ```bash
+   bin/apexyard unattended-plan docs/prds/PRD-003-search.md --rehearse --tickets 41
+   ```
+
+   - Press Enter at the `[rehearse] About to send: /approve-merge ...` prompt.
+   - Check that the merge went through the normal merge gate.
+   - Check that the CEO marker has a `proxy=` line.
+   - Check that `approvals.jsonl` has a `sent` line and a `merge-outcome` line.
+   - This step also verifies the one undocumented mechanism: a slash command
+     sent as the prompt of a resumed `-p` turn runs the human-only skill.
+4. Start the run and leave.
+
+   ```bash
+   /unattended-plan docs/prds/PRD-003-search.md --tmux
+   ```
+
+   The command prints the PID and the log path. You can close the session.
+   `--tmux` opens a tmux window with the log when you are inside tmux.
+5. Read the summary when you return. It is at
+   `.claude/session/unattended/<project>-<prd>/summary.md`.
+6. Clear each needs-owner item. Then continue the run:
+
+   ```bash
+   /unattended-plan docs/prds/PRD-003-search.md --resume
+   ```
+
+   `--resume` skips each ticket that is closed with a merged PR. It starts at
+   the first ticket that is not done.
+
+## Notifications
+
+The supervisor notifies you on a halt, at the end of a run, and on each
+needs-owner item:
+
+- It sends a desktop notification with `notify-send` when `DISPLAY` or
+  `WAYLAND_DISPLAY` is set.
+- It sends a JSON POST to `config.notify_webhook` when the sidecar sets an
+  `http` or `https` URL. The body holds `event`, `run`, `prd`, `project`,
+  `ticket`, `message`, and `summary`.
+- A failed notification is logged and never stops the run.
+
+## The summary
+
+`summary.md` has these parts, in this order:
+
+1. The result (`done` or `halted`), the count of tickets done, the PRD, the
+   project, the epic, the run id, the start and finish times, and the cost.
+2. **Tickets**: one row per ticket with its status, branch, PR link, turns,
+   cost, and Rex rounds.
+3. **Needs owner**: each item with its code and the exact detail.
+4. **Approvals sent**: one row per line of `approvals.jsonl`.
+5. **Halt reason** and **Resume**, only when the run halted.
 
 ## Stop and resume
 
@@ -169,7 +247,7 @@ check, and the run halts with no progress.
 | `config.max_ticket_usd` | 60 | The cost ceiling for one ticket. |
 | `config.max_run_usd` | 300 | The cost ceiling for the run. |
 | `config.turn_timeout_s` | 5400 | The wall-clock limit for one child turn. |
-| `config.notify_webhook` | empty | A URL that receives a POST on halt, done, and each needs-owner item (ships with #5). |
+| `config.notify_webhook` | empty | A URL that receives a POST on halt, done, and each needs-owner item. |
 
 ## Files
 

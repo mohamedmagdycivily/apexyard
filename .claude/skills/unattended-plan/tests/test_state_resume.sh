@@ -18,6 +18,7 @@ UT_SUPERVISOR="$ROOT/bin/unattended-supervisor"
 # shellcheck source=_lib-unattended-test.sh
 . "$HERE/_lib-unattended-test.sh"
 unset APEXYARD_UNATTENDED_SUPERVISED APEXYARD_APPROVAL_PROXY
+unset DISPLAY WAYLAND_DISPLAY
 export FAKE_SCENARIO="$HERE/scenarios/resume.sh"
 
 # seed_state <ticket-12 json fields> [halted json] — a state.json as a crashed

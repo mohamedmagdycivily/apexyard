@@ -18,6 +18,7 @@ UT_SUPERVISOR="$ROOT/bin/unattended-supervisor"
 # shellcheck source=_lib-unattended-test.sh
 . "$HERE/_lib-unattended-test.sh"
 unset APEXYARD_UNATTENDED_SUPERVISED APEXYARD_APPROVAL_PROXY UNATTENDED_FOREGROUND
+unset DISPLAY WAYLAND_DISPLAY
 export FAKE_SCENARIO="$HERE/scenarios/happy.sh"
 export CLAUDE_CODE_SESSION_ID=owner-cli-session
 
@@ -87,6 +88,13 @@ for _ in $(seq 1 60); do
 done
 check "detached supervisor finished both tickets" '[ "$(jq -r "[.tickets[].status] | join(\",\")" "$STATE_DIR/state.json" 2>/dev/null)" = "done,done" ]' "$(cat "$STATE_DIR/console.log" 2>/dev/null | tail -5)"
 check "console output captured" '[ -f "$STATE_DIR/console.log" ]'
+cleanup
+
+echo "== --tmux outside tmux"
+setup; ( unset TMUX; UNATTENDED_FOREGROUND=1 cli "$PRD_FILE" --tmux )
+OUT="$(cd "$SB" && env -u TMUX bash "$CLI" "$PRD_FILE" --tmux < /dev/null 2>&1)"; RC=$?
+check "--tmux outside tmux says so and still starts" '[ "$RC" = 0 ] && printf "%s" "$OUT" | grep -q "not inside tmux"' "$OUT"
+for _ in $(seq 1 60); do [ -f "$STATE_DIR/summary.md" ] && [ ! -f "$STATE_DIR/lock" ] && break; sleep 0.5; done
 cleanup
 
 echo "== bin/apexyard arm"

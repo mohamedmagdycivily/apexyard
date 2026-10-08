@@ -2,7 +2,7 @@
 name: unattended-plan
 description: Human-only. Start an Unattended Mode run that works a PRD's tickets in series and proxies the owner's approvals.
 disable-model-invocation: true
-argument-hint: "<prd-path> [--project <name>] [--plan-only] [--tickets 12,14] [--rehearse] [--dry-run] [--resume] [--stop] [--status]"
+argument-hint: "<prd-path> [--project <name>] [--plan-only] [--tickets 12,14] [--rehearse] [--dry-run] [--resume] [--stop] [--status] [--tmux]"
 effort: low
 ---
 
@@ -67,6 +67,7 @@ the session.
 | `--resume` | Reconcile with the tracker and continue at the first ticket that is not done. |
 | `--stop` | Remove the run token and stop after the current turn. |
 | `--status` | Print the run state. |
+| `--tmux` | Open a tmux window with the log, when you run inside tmux. |
 
 ## Notes
 

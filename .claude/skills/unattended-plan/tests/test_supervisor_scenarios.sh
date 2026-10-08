@@ -20,6 +20,8 @@ UT_SUPERVISOR="$ROOT/bin/unattended-supervisor"
 export CLAUDE_CODE_SESSION_ID=parent-session-id
 export CLAUDECODE=1
 unset APEXYARD_UNATTENDED_SUPERVISED APEXYARD_APPROVAL_PROXY
+# No desktop notifications from the tests, except the case that sets DISPLAY.
+unset DISPLAY WAYLAND_DISPLAY
 
 run_scenario() { # <scenario> [supervisor args...] → sets RC, OUT
   export FAKE_SCENARIO="$HERE/scenarios/$1.sh"; shift
@@ -277,6 +279,61 @@ ut_sandbox; two_tickets '[]'; run_scenario sec-log-forge --tickets 12
 check "sec-log: no forged START line" '! grep -q "^2026-01-01T00:00:00Z START run=forged" "$STATE_DIR/supervisor.log"'
 check "sec-perms: state.json is private (600)" '[ "$(stat -c %a "$STATE_DIR/state.json")" = 600 ]'
 check "sec-perms: turn logs are private" '[ "$(stat -c %a "$STATE_DIR/logs/ticket-12/turn-1.jsonl")" = 600 ]'
+cleanup
+
+echo "== sec: unicode slash"
+ut_sandbox; two_tickets '[]'; run_scenario sec-unicode-slash --tickets 12
+check "sec-unicode: a slash behind U+00A0 is sent as plain text" 'grep -q "plain text" "$FAKE_DIR/prompt.ticket_12.2"' "$(cat "$FAKE_DIR/prompt.ticket_12.2")"
+cleanup
+
+echo "== sec: fork PR"
+ut_sandbox; two_tickets '[]'; run_scenario sec-fork-pr --tickets 12
+check "sec-fork: a PR from another repository is refused" 'grep -q "comes from evil/widget, not acme/widget" "$FAKE_DIR/prompt.ticket_12.2" && [ ! -s "$STATE_DIR/approvals.jsonl" ]'
+cleanup
+
+echo "== sec: footer in a comment"
+ut_sandbox; two_tickets '[]'; run_scenario sec-comment-review --tickets 12
+check "sec-comment: a Rex footer in an issue comment is not a review" 'grep -q "No posted Rex review" "$FAKE_DIR/prompt.ticket_12.2"'
+cleanup
+
+# ------------------------------------------------------------------ notify --
+echo "== notify"
+ut_sandbox; two_tickets '[12]'
+jq '.config.notify_webhook = "https://hooks.example.test/x"' "$SB/docs/PRD-001-x.unattended.json" > "$SB/t" && mv "$SB/t" "$SB/docs/PRD-001-x.unattended.json"
+DISPLAY=:99 run_scenario blocked-dependent
+check "notify: desktop notification for the needs-owner item and the halt" 'grep -q "Unattended needs_owner" "$FAKE_DIR/notify.log" && grep -q "Unattended halt" "$FAKE_DIR/notify.log"' "$(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
+check "notify: webhook POSTs JSON with the event" 'grep -q "https://hooks.example.test/x" "$FAKE_DIR/curl.log" && grep -q "\"event\":\"needs_owner\"" "$FAKE_DIR/curl.log" && grep -q "\"event\":\"halt\"" "$FAKE_DIR/curl.log"' "$(cat "$FAKE_DIR/curl.log" 2>/dev/null)"
+cleanup
+ut_sandbox; two_tickets; run_scenario happy
+check "notify: no display, no webhook, no notification" '[ ! -s "$FAKE_DIR/notify.log" ] && [ ! -s "$FAKE_DIR/curl.log" ]'
+check "notify: done run still exits 0" '[ "$RC" = 0 ]' "$OUT"
+cleanup
+ut_sandbox; two_tickets '[]'
+jq '.config.notify_webhook = "file:///etc/passwd"' "$SB/docs/PRD-001-x.unattended.json" > "$SB/t" && mv "$SB/t" "$SB/docs/PRD-001-x.unattended.json"
+run_scenario blocked-independent
+check "notify: a non-http webhook is skipped" '[ ! -s "$FAKE_DIR/curl.log" ] && grep -q "notify_webhook is not an http(s) URL" "$STATE_DIR/supervisor.log"'
+cleanup
+ut_sandbox; two_tickets '[]'
+jq '.config.notify_webhook = "https://hooks.example.test/x"' "$SB/docs/PRD-001-x.unattended.json" > "$SB/t" && mv "$SB/t" "$SB/docs/PRD-001-x.unattended.json"
+printf '#!/bin/bash\nexit 7\n' > "$SB/bin/curl"
+run_scenario happy
+check "notify: a failing webhook never fails the run" '[ "$RC" = 0 ] && grep -q "notify_webhook POST failed" "$STATE_DIR/supervisor.log"' "$OUT"
+cleanup
+
+# ------------------------------------------------------------ summary layout --
+echo "== summary layout"
+ut_sandbox; two_tickets '[12]'; run_scenario blocked-dependent
+SUM="$STATE_DIR/summary.md"
+check "summary: section order" '[ "$(grep "^#" "$SUM" | tr "\n" "|")" = "# Unattended run summary|## Tickets|## Needs owner|## Approvals sent|## Halt reason|## Resume|" ]' "$(grep "^#" "$SUM")"
+check "summary: result and counts first" '[ "$(sed -n 3p "$SUM")" = "- Result: **halted**" ] && [ "$(sed -n 4p "$SUM")" = "- Tickets done: 0 of 2" ]' "$(head -6 "$SUM")"
+check "summary: ticket table header" 'grep -qx "| Ticket | Title | Status | Branch | PR | Turns | Cost USD | Rex rounds |" "$SUM"'
+check "summary: needs-owner item with detail" 'grep -q "^- #12 \`credentials\`: the payment API key is not set" "$SUM"'
+check "summary: resume command" 'grep -qx "/unattended-plan $PRD_FILE --resume" "$SUM"'
+cleanup
+ut_sandbox; two_tickets; run_scenario happy
+check "summary: approvals table on a done run" 'grep -qx "| Time | Ticket | PR | Kind | HEAD | Result |" "$STATE_DIR/summary.md" && grep -q "| #12 | #101 | merge | aaaaaaaaaaaa | sent |" "$STATE_DIR/summary.md" && ! grep -q "## Resume" "$STATE_DIR/summary.md"'
+check "umask: child sessions run with umask 022" 'grep -q "umask=0022" "$FAKE_DIR/env.log" && ! grep -q "umask=0077" "$FAKE_DIR/env.log"'
+check "perms: the state dir is 700" '[ "$(stat -c %a "$STATE_DIR")" = 700 ]'
 cleanup
 
 # -------------------------------------------------------------- ask-no-rec --
