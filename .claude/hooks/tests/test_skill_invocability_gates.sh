@@ -139,6 +139,12 @@ for s in approve-merge approve-design approve-architecture; do
     "Approval skills write the markers merge gates read; /approve-merge also merges. The invocation IS the approval, so a human must make it (see .claude/rules/pr-workflow.md and AgDR-0110)."
 done
 
+# /unattended-plan writes the run token that authorizes proxied approvals for
+# one run. Its invocation is the owner's delegation of approval (AgDR-0222),
+# so a model must never be able to start a run.
+expect_flag "unattended-plan" "true" \
+  "/unattended-plan writes the run token that lets bin/unattended-supervisor send /approve-* on the owner's behalf. The invocation IS the delegation of approval, so a human must make it (AgDR-0222)."
+
 # ---------------------------------------------------------------------------
 # The combination is what matters: if review skills are unlocked, approval
 # skills MUST be locked, or the model can drive the whole chain unattended.
@@ -187,7 +193,9 @@ fi
 
 # Only skills whose INVOCATION IS THE APPROVAL belong here (AgDR-0110).
 # A skill that merely writes a document, reads state, or reports does not.
-LOCK_ALLOWED="approve-merge approve-design approve-architecture"
+# unattended-plan: invoking it is the owner's delegation of approval for that
+# run, so it is approval-class too (AgDR-0222).
+LOCK_ALLOWED="approve-merge approve-design approve-architecture unattended-plan"
 
 UNJUSTIFIED=0
 for f in "$SKILLS"/*/SKILL.md; do

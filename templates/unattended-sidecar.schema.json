@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Unattended Mode sidecar (<prd-basename>.unattended.json)",
+  "description": "Run config, epic, and the strict ticket order for one PRD. Written by bin/unattended-supervisor after the planning session. An existing sidecar always wins. See docs/unattended.md and AgDR-0222.",
+  "type": "object",
+  "required": ["config", "tickets"],
+  "properties": {
+    "config": {
+      "type": "object",
+      "properties": {
+        "execution_prompt": { "type": "string", "default": "", "description": "Path to a prompt file each ticket session receives first. Relative paths resolve against the PRD's directory." },
+        "max_turn_usd": { "type": "number", "default": 15 },
+        "max_ticket_usd": { "type": "number", "default": 60 },
+        "max_run_usd": { "type": "number", "default": 300 },
+        "turn_timeout_s": { "type": "integer", "default": 5400 },
+        "notify_webhook": { "type": "string", "default": "" }
+      },
+      "additionalProperties": false
+    },
+    "epic": { "type": ["integer", "null"] },
+    "tickets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["n"],
+        "properties": {
+          "n": { "type": "integer" },
+          "title": { "type": "string" },
+          "blocked_by": { "type": "array", "items": { "type": "integer" }, "default": [] },
+          "owner_only": { "type": "boolean", "default": false },
+          "ui": { "type": "boolean", "default": false }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
