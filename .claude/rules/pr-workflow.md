@@ -282,7 +282,7 @@ with the `skillOverrides` setting, or by turning bundled skills off
 
 ### The approval skills are human-only (#1042, AgDR-0110)
 
-"Explicit per-PR approval" is now enforced **mechanically**, not only in prose. `/approve-merge`, `/approve-design`, and `/approve-architecture` carry `disable-model-invocation: true`, so **only a human can invoke them**. Saying "approved" in conversation is no longer sufficient on its own — the operator types the command, and that invocation *is* the approval moment this rule has always described.
+"Explicit per-PR approval" is now enforced **mechanically**, not only in prose. `/approve-merge`, `/approve-design`, and `/approve-architecture` carry `disable-model-invocation: true`, so **only a human can invoke them**. Saying "approved" in conversation is no longer sufficient on its own — the operator types the command, and that invocation *is* the approval moment this rule has always described. A `/approve-*` command that `bin/unattended-supervisor` sends into a child session is a human invocation by delegation, because the owner authorized that run with the human-only `/unattended-plan` (AgDR-0222). The CEO marker records it with a `proxy=` line.
 
 The mirror half matters just as much: the **review** skills (`/code-review`, `/security-review`, `/design-review`) are model-invocable, so the orchestrator triggers them itself — as `auto-code-review.sh` has always instructed. Independence comes from the reviewer being a **separate sub-agent with its own context**, not from who typed the command, so nothing is lost by letting the model start a review.
 

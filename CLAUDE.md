@@ -116,6 +116,7 @@ Read the named file when the work matches. Do not auto-import these files. Claud
 | `.claude/rules/glossary-lookup.md` | An adopter asks what a core SDLC term means |
 | `.claude/rules/code-standards.md` | Writing application code |
 | `.claude/rules/build-handbook-discovery.md` | Starting Build-phase implementation |
+| `.claude/rules/unattended-mode.md` | `APEXYARD_UNATTENDED_SUPERVISED=1` is set (a supervised child session) |
 
 ### Always-on floor
 
@@ -125,7 +126,7 @@ These one-liners stay here because agents use them on almost every turn. The ful
 - `Ticket`, `#N`, and `blocked by #N` name only a real tracker issue. Use `Step N` or a plain bullet for a plan item that is not yet filed.
 - Never `git add -A` or `git add .`. Never push directly to `main`.
 - Tests, lint, typecheck, and build must pass before push. Coverage for domain logic stays above 80%.
-- Every merge needs Rex plus an explicit per-PR human nod. A plan-level "go" does not authorize merge.
+- Every merge needs Rex plus an explicit per-PR human nod. A plan-level "go" does not authorize merge. In a run the owner starts with `/unattended-plan`, the supervisor sends that nod by delegation (AgDR-0222).
 - No hardcoded secrets. Use environment variables.
 - Code review process: `workflows/code-review.md`.
 - AgDR template: `templates/agdr.md`.
@@ -165,7 +166,7 @@ ApexYard ships with a `.claude/` directory containing the Claude Code primitives
 | Layer | Path | Purpose |
 |-------|------|---------|
 | Hooks | `.claude/hooks/` | 60 shell scripts that mechanically enforce SDLC rules — ticket-first (Edit/Write/Bash), migration-ticket-first, auto code review, merge gates (Rex + CEO + design review + architecture review), red-CI block, commit format, AgDR for arch changes, branch/PR-title validation, secrets scanning, onboarding-config guard, upstream-drift banner, leak protection, MCP-reindex-after-clone/-pull advisories, bootstrap-skill exemption, skill-intent detection, gate-invisible review-marker detection |
-| Rules | `.claude/rules/` | 22 modular rule files (AgDR triggers, agent role selection, build-handbook discovery, code standards, evidence grounding, git conventions, glossary lookup, isolated builds, leak protection, loop mode, parallel work, plan mode, PR quality, PR workflow, reconcile before build, reporting style, right-size ceremony, role triggers, skill first, ticket vocabulary, workflow gates, writing standard) |
+| Rules | `.claude/rules/` | 23 modular rule files (AgDR triggers, agent role selection, build-handbook discovery, code standards, evidence grounding, git conventions, glossary lookup, isolated builds, leak protection, loop mode, parallel work, plan mode, PR quality, PR workflow, reconcile before build, reporting style, right-size ceremony, role triggers, skill first, ticket vocabulary, unattended mode, workflow gates, writing standard) |
 | Handbooks | `handbooks/` | Adopter-authored coding standards consumed by Rex during code review. Discovery by path-convention (`architecture/` + `general/` always-load; `language/<lang>/` loads on diff-match). Advisory by default; opt in to blocking via `ENFORCEMENT: blocking` marker. See [`handbooks/README.md`](handbooks/README.md). |
 | Agents | `.claude/agents/` | 23 sub-agents (4 utility incl. Hakim post-consolidation + Naqid the Contrarian + 7 engineering + 1 architecture (Tariq) + 6 product-design + 5 security-data). Per AgDR-0050 + the #347 PR 3 Hatim→Hakim consolidation decision + AgDR-0054 (Solution Architect) + AgDR-0078 (The Contrarian) + AgDR-0105 (retiring the pr-manager + ticket-manager lifecycle agents). |
 | Skills | `.claude/skills/` | 67 slash commands — see the full list below |
