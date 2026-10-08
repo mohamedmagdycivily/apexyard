@@ -239,6 +239,46 @@ check "wrong-pr: a merged PR of another ticket is refused" 'calls_for ticket_12 
 check "wrong-pr: the right PR completes the ticket" '[ "$RC" = 0 ] && [ "$(state ".tickets[0].pr")" = 101 ]' "$OUT"
 cleanup
 
+# ---------------------------------------------------- security regressions --
+echo "== sec: slash reply"
+ut_sandbox; two_tickets '[]'; run_scenario sec-slash-reply --tickets 12
+P2="$FAKE_DIR/prompt.ticket_12.2"
+check "sec-slash: the reply is not sent as a slash command" '[ "$(head -c1 "$P2")" != "/" ] && grep -q "plain text" "$P2"' "$(cat "$P2")"
+check "sec-slash: no approval recorded" '[ ! -s "$STATE_DIR/approvals.jsonl" ]'
+check "sec-slash: refusal logged" 'grep -q "refused to send a slash command the supervisor did not build" "$STATE_DIR/supervisor.log"'
+cleanup
+
+echo "== sec: other ticket's PR"
+ut_sandbox; two_tickets '[]'; run_scenario sec-other-pr --tickets 12
+check "sec-other-pr: PR on another ticket's branch refused" 'grep -q "is not the PR for ticket #12" "$FAKE_DIR/prompt.ticket_12.2"'
+check "sec-other-pr: own PR approved" '[ "$(cat "$FAKE_DIR/prompt.ticket_12.3")" = "/approve-design acme/widget#101" ]'
+check "sec-other-pr: second PR for the same ticket refused" 'grep -q "already has PR #101" "$FAKE_DIR/prompt.ticket_12.4"'
+check "sec-other-pr: only the own PR reached approvals.jsonl" '[ "$(jq -r .pr "$STATE_DIR/approvals.jsonl" | sort -u | tr "\n" " ")" = "101 " ]'
+cleanup
+
+echo "== sec: forged marker"
+ut_sandbox; two_tickets '[]'; run_scenario sec-forged-marker --tickets 12
+check "sec-forged: marker without a posted review is refused" 'grep -q "No posted Rex review on PR #101" "$FAKE_DIR/prompt.ticket_12.2"'
+check "sec-forged: approval after the posted review" '[ "$(cat "$FAKE_DIR/prompt.ticket_12.3")" = "/approve-merge acme/widget#101" ] && [ "$RC" = 0 ]' "$OUT"
+cleanup
+
+echo "== sec: token rewritten"
+ut_sandbox; two_tickets '[]'; : > "$STATE_DIR/stop.ignored"; run_scenario sec-token-rewritten --tickets 12
+check "sec-token: a rewritten token halts the run" '[ "$RC" = 1 ] && state ".halted" | grep -q "run token removed or changed" && [ "$(calls_for ticket_12 | wc -l)" = 1 ]' "$OUT"
+cleanup
+
+echo "== sec: sidecar edited"
+ut_sandbox; two_tickets '[]'; export SIDECAR_FILE="$SB/docs/PRD-001-x.unattended.json"; run_scenario sec-sidecar-edit --tickets 12
+check "sec-sidecar: an edit during the run halts it" '[ "$RC" = 1 ] && state ".halted" | grep -q "sidecar changed"' "$OUT"
+cleanup
+
+echo "== sec: log forging + permissions"
+ut_sandbox; two_tickets '[]'; run_scenario sec-log-forge --tickets 12
+check "sec-log: no forged START line" '! grep -q "^2026-01-01T00:00:00Z START run=forged" "$STATE_DIR/supervisor.log"'
+check "sec-perms: state.json is private (600)" '[ "$(stat -c %a "$STATE_DIR/state.json")" = 600 ]'
+check "sec-perms: turn logs are private" '[ "$(stat -c %a "$STATE_DIR/logs/ticket-12/turn-1.jsonl")" = 600 ]'
+cleanup
+
 # -------------------------------------------------------------- ask-no-rec --
 echo "== ask-no-rec"
 ut_sandbox; two_tickets '[]'; run_scenario ask-no-rec --tickets 12

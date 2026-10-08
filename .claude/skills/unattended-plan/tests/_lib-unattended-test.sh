@@ -65,7 +65,14 @@ pr_state_of() { jq -r .state "$FAKE_DIR/prs/$1.json"; }
 
 pr_head() { jq -r .headRefOid "$FAKE_DIR/prs/$1.json"; }
 
-rex_ok() { # <p> — Rex approved the PR's current head
+rex_ok() { # <p> — Rex approved the PR's current head: marker + posted review
+  local h; h="$(pr_head "$1")"
+  printf '%s\n' "$h" > "$OPS_DIR/.claude/session/reviews/acme__widget__$1-rex.approved"
+  jq --arg h "$h" '.reviews = ((.reviews // []) + [{body: ("Verdict: APPROVED\n\nReviewed commit: " + $h)}])' \
+    "$FAKE_DIR/prs/$1.json" > "$FAKE_DIR/prs/$1.json.tmp" && mv "$FAKE_DIR/prs/$1.json.tmp" "$FAKE_DIR/prs/$1.json"
+}
+
+rex_marker_only() { # <p> — a marker file with no posted review (forged)
   printf '%s\n' "$(pr_head "$1")" > "$OPS_DIR/.claude/session/reviews/acme__widget__$1-rex.approved"
 }
 

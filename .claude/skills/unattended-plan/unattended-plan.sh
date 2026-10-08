@@ -23,6 +23,9 @@ if [ "${APEXYARD_UNATTENDED_SUPERVISED:-}" = 1 ]; then
   exit 2
 fi
 
+# The token and the run's state are private to the owner.
+umask 077
+
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPS="${UNATTENDED_OPS_ROOT:-$(cd "$SELF_DIR/../../.." && pwd)}"
 SUPERVISOR="$(cd "$SELF_DIR/../../.." && pwd)/bin/unattended-supervisor"
@@ -172,7 +175,7 @@ setsid -f "$SUPERVISOR" run "${SV_ARGS[@]}" "${PASS[@]}" >> "$STATE_DIR/console.
 
 pid=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do pid="$(live_pid)" && break; sleep 0.5; done
-if [ -z "$pid" ] && ! grep -q 'START run=' "$STATE_DIR/supervisor.log" 2>/dev/null; then
+if [ -z "$pid" ] && ! grep -qF "START run=$run_id " "$STATE_DIR/supervisor.log" 2>/dev/null; then
   # The supervisor exited before it took the lock: report its output, not success.
   echo "unattended-plan: the supervisor exited at once. Its output:" >&2
   tail -n 20 "$STATE_DIR/console.log" >&2 2>/dev/null
