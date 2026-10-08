@@ -10,8 +10,8 @@ The workflow does not change. Gates, hooks, review markers, and Rex do not
 change. There is no per-project setting. The command authorizes one run only.
 The decision record is [AgDR-0222](agdr/AgDR-0222-unattended-supervisor-as-owner-proxy.md).
 
-> **Status**: the supervisor and the command are available. The `proxy=` audit
-> line in the CEO marker ships with the approval-audit change (#4).
+> **Status**: the supervisor, the command, and the approval audit are
+> available. Notifications ship with #5.
 
 ## Terms
 
@@ -193,6 +193,22 @@ Each `approvals.jsonl` line holds `at`, `run`, `ticket`, `pr`, `kind`, `head`,
 `rex`, `command`, `result`, and `started_by`. The supervisor writes a line with
 `result: "sent"` when it sends an approval. It writes a `merge-outcome` line
 with `result: "merged"` after it verifies the merge.
+
+`/approve-merge` and `/approve-design` refuse a proxied approval when no run
+token for that run id exists. They only read the token. A proxied CEO marker
+looks like this:
+
+```text
+sha=<head>
+approved_by=user
+approved_at=2026-10-08T12:00:00Z
+skill_version=2
+approval_summary="[proxy: run=<id> ticket=12] /approve-merge acme/widget#101"
+proxy="unattended-plan run=<id> prd=<path> ticket=12 started_by=<owner session>"
+```
+
+The design marker stays one bare SHA, so `approvals.jsonl` is its only audit
+record.
 
 Each proxied merge leaves two records:
 

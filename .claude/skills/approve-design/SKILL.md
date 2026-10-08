@@ -108,6 +108,24 @@ REX=$(review_marker_path "$PR_HOST_REPO" <pr> rex "$MARKER_HOME")
 
 If Rex's marker is missing or its SHA doesn't match HEAD, refuse and tell the user to re-invoke the code-reviewer first. Do not write the design marker on a stale base.
 
+### 4a. Check a proxied approval (Unattended Mode, AgDR-0222)
+
+When `bin/unattended-supervisor` sent this command into a supervised child session, `APEXYARD_APPROVAL_PROXY` is set. Accept the delegated approval only while that run's token exists:
+
+```bash
+# (MARKER_HOME already resolved in step 4.) A no-op that succeeds when the
+# variable is unset, so the attended flow is unchanged.
+# shellcheck source=/dev/null
+. "$MARKER_HOME/.claude/skills/unattended-plan/_lib-unattended-proxy.sh"
+unattended_proxy_check "$MARKER_HOME"
+```
+
+If the check fails, refuse. Print its `REFUSED:` message and end the turn with `UNATTENDED-BLOCKED: privileged <message>`. Do not write the design marker.
+
+Only read the token. Never write, `chmod`, or `touch` it.
+
+The design marker gets no `proxy=` line. `require-design-review-for-ui.sh` reads that marker as one bare SHA, so an extra line would break the gate. The supervisor's `approvals.jsonl` records the proxied design approval instead.
+
 ### 5. Verify the PR actually touches UI files
 
 Check whether the PR's diff includes files that would trigger the design-review gate. If the PR has NO UI files, the marker is unnecessary — tell the user and skip.
