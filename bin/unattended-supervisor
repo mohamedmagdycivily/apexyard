@@ -359,8 +359,9 @@ child_turn() {
          --max-budget-usd "$MAX_TURN_USD")
   # A child runs in acceptEdits with no prompts, so every directory it must
   # read or edit outside the ops root has to be added explicitly (#11).
+  # Read one path per line: a path with a space must stay one argument.
   local d
-  for d in $(child_dirs); do args+=(--add-dir "$d"); done
+  while IFS= read -r d; do args+=(--add-dir "$d"); done < <(child_dirs)
 
   unset_args=()
   for v in $SCRUB_VARS; do unset_args+=(-u "$v"); done
@@ -519,7 +520,9 @@ load_config() {
   if [ -z "$ep" ]; then ep="$(find_execution_prompt)"; [ -n "$ep" ] && log "PROMPT: using $ep (found by convention)"; fi
   if [ -n "$ep" ]; then
     case "$ep" in /*) ;; *) ep="$(dirname "$PRD")/$ep" ;; esac
-    if [ -f "$ep" ]; then EXEC_PROMPT_TEXT="$(cat "$ep")"
+    # Log a checksum: a child can edit files in the PRD's directory, so a
+    # changed prompt between runs must be visible in the log.
+    if [ -f "$ep" ]; then EXEC_PROMPT_TEXT="$(cat "$ep")"; log "PROMPT: $ep cksum $(cksum < "$ep" | cut -d' ' -f1)"
     else log "WARNING: execution_prompt $ep not found, using the generic prompt"; fi
   fi
   [ -z "$EXEC_PROMPT_TEXT" ] && log "PROMPT: no execution prompt, using the generic ticket prompt"
@@ -901,13 +904,23 @@ work_ticket() {
 # one fix the owner must make (#11).
 prepare_workspace() {
   [ -n "$WORKSPACE" ] || return 0
-  local branches
-  branches="$(gh api "repos/$REPO/branches" --jq 'length' 2>/dev/null)"
+  local branches origin
+  if ! branches="$(gh api "repos/$REPO/branches" --jq 'length' 2>/dev/null)"; then
+    needs_owner null workspace "could not list the branches of $REPO (check gh auth and the network)"
+    halt "could not reach $REPO"; return 1
+  fi
   if [ "${branches:-0}" = 0 ]; then
     needs_owner null empty-repo "$REPO has no branch. Push one initial commit to its default branch, then run --resume"
     halt "$REPO has no commits"; return 1
   fi
-  [ -d "$WORKSPACE/.git" ] && return 0
+  # An existing clone (or worktree: .git may be a file) must be of $REPO.
+  if [ -e "$WORKSPACE/.git" ]; then
+    origin="$(git -C "$WORKSPACE" remote get-url origin 2>/dev/null)"
+    origin="$(printf '%s' "$origin" | sed -E 's#\.git$##; s#^(https?://[^/]+/|git@[^:]+:|ssh://git@[^/]+/)##' | tr '[:upper:]' '[:lower:]')"
+    if [ "$origin" = "$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" ]; then return 0; fi
+    needs_owner null workspace "$WORKSPACE is a clone of ${origin:-an unknown repo}, not $REPO"
+    halt "workspace is a clone of another repo"; return 1
+  fi
   if [ -e "$WORKSPACE" ] && [ -n "$(ls -A "$WORKSPACE" 2>/dev/null)" ]; then
     needs_owner null workspace "$WORKSPACE exists but is not a git clone"
     halt "workspace is not a clone"; return 1
@@ -1028,7 +1041,7 @@ cmd_dry_run() {
   echo "    timeout -s INT --kill-after=120 $TURN_TIMEOUT_S $CLAUDE_BIN -p <ticket prompt> --session-id <uuid> (then --resume <uuid>) \\"
   echo "    --name unattended:$PROJECT:$PRD_BASE:ticket-<n> --output-format stream-json --verbose \\"
   echo "    --append-system-prompt <templates/unattended-child.md> --permission-mode acceptEdits --permission-prompts none \\"
-  echo "    --allowedTools $CHILD_ALLOWED_TOOLS --disallowedTools $CHILD_DISALLOWED_TOOLS --max-budget-usd $MAX_TURN_USD$(child_dirs | sed 's/^/ --add-dir /' | tr -d '\n')"
+  echo "    --allowedTools $CHILD_ALLOWED_TOOLS --disallowedTools $CHILD_DISALLOWED_TOOLS --max-budget-usd $MAX_TURN_USD$(child_dirs | while IFS= read -r d; do printf " --add-dir %q" "$d"; done)"
   echo "  gh pr view <pr> --repo $REPO --json number,state,isDraft,headRefOid,headRefName,url"
   echo "  gh pr checks <pr> --repo $REPO --json bucket"
   echo "  tracker_view <n> $REPO"

@@ -122,9 +122,32 @@ run_scenario happy --tickets 12 --workspace "$SB/ws"
 check "workspace: a non-clone directory halts" '[ "$RC" = 1 ] && state ".halted" | grep -q "workspace is not a clone"' "$OUT"
 cleanup
 ut_sandbox; two_tickets '[]'
+FAKE_GH_DOWN=1 run_scenario happy --tickets 12 --workspace "$SB/ws"
+check "workspace: a failed branch query halts without the empty-repo advice" '[ "$RC" = 1 ] && state ".needs_owner[0].detail" | grep -q "check gh auth" && ! state ".needs_owner[0].detail" | grep -q "initial commit"' "$OUT"
+cleanup
+ut_sandbox; two_tickets '[]'; git init -q "$SB/ws"; git -C "$SB/ws" remote add origin https://github.com/acme/other.git
+run_scenario happy --tickets 12 --workspace "$SB/ws"
+check "workspace: a clone of another repo halts" '[ "$RC" = 1 ] && state ".halted" | grep -q "clone of another repo"' "$OUT"
+cleanup
+ut_sandbox; two_tickets '[]'; git init -q "$SB/ws"; git -C "$SB/ws" remote add origin git@github.com:Acme/Widget.git
+run_scenario happy --tickets 12 --workspace "$SB/ws"
+check "workspace: an existing clone of the repo (ssh, other case) is used" '[ "$RC" = 0 ] && [ ! -f "$FAKE_DIR/cloned" ]' "$OUT"
+cleanup
+ut_sandbox; two_tickets '[]'
 run_scenario happy --tickets 12 --workspace "$SB/ws"
 check "workspace: missing clone is cloned, then the ticket runs" '[ "$RC" = 0 ] && [ -d "$SB/ws/.git" ] && grep "^ticket_12" "$FAKE_DIR/argv.log" | head -1 | grep -qF -- "--add-dir $SB/ws"' "$OUT"
 cleanup
+
+echo "== paths with spaces"
+mkdir -p "${TMPDIR:-/tmp}/ut space dir"
+UT_TMP="${TMPDIR:-/tmp}/ut space dir" ut_sandbox; two_tickets '[]'
+mkdir -p "$SB/my ws"; git init -q "$SB/my ws"; git -C "$SB/my ws" remote add origin https://github.com/acme/widget.git
+run_scenario happy --tickets 12 --workspace "$SB/my ws"
+check "spaces: the run completes" '[ "$RC" = 0 ]' "$OUT"
+check "spaces: --add-dir keeps each path whole" 'grep "^ticket_12" "$FAKE_DIR/argv.log" | head -1 | grep -qF -- "--add-dir $SB/my ws --add-dir $SB/docs"' "$(grep "^ticket_12" "$FAKE_DIR/argv.log" | head -1 | grep -o -- "--add-dir.*--disallowed" )"
+check "spaces: the prompt checksum is logged" 'grep -q "PROMPT: " "$STATE_DIR/supervisor.log"'
+cleanup
+rmdir "${TMPDIR:-/tmp}/ut space dir" 2>/dev/null
 
 # --------------------------------------------------------------- ampersand --
 echo "== ampersand"

@@ -25,10 +25,10 @@ case "$sub" in
   "repo clone")
     # gh repo clone <repo> <dir>: make an empty git clone stand-in.
     [ "${FAKE_CLONE_FAIL:-0}" = 1 ] && exit 1
-    mkdir -p "$4" && git -C "$4" init -q && echo "$3" > "$FAKE_DIR/cloned" ;;
+    mkdir -p "$4" && git -C "$4" init -q && git -C "$4" remote add origin "https://github.com/$3.git" && echo "$3" > "$FAKE_DIR/cloned" ;;
   *)
     case "$*" in
-      "api repos/"*"/branches"*) echo "${FAKE_BRANCHES:-1}" ;;
+      "api repos/"*"/branches"*) [ "${FAKE_GH_DOWN:-0}" = 1 ] && exit 1; echo "${FAKE_BRANCHES:-1}" ;;
     esac
     exit 0 ;;
 esac
