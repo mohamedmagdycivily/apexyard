@@ -250,6 +250,7 @@ check, and the run halts with no progress.
 | The run token is missing at an approval | Halt. |
 | The stop file exists | Finish the turn, then halt. |
 | The run cost reaches `max_run_usd` | Halt. |
+| The sidecar changes during the run, other than the four limits | Needs-owner item, halt. |
 
 ## The sidecar
 
@@ -269,6 +270,34 @@ check, and the run halts with no progress.
 | `config.max_run_usd` | 300 | The cost ceiling for the run. |
 | `config.turn_timeout_s` | 5400 | The wall-clock limit for one child turn. |
 | `config.notify_webhook` | empty | A URL that receives a POST on halt, done, and each needs-owner item. |
+
+You can raise or lower the four limits (`max_turn_usd`, `max_ticket_usd`,
+`max_run_usd`, `turn_timeout_s`) while a run is going. The supervisor reads
+them again before every turn, logs each change as
+`CONFIG: <key> <old> -> <new>`, and sends a notification. A value that is not a
+positive number is ignored and logged. A mid-run change to anything else in the
+sidecar (the ticket plan, `execution_prompt`, `notify_webhook`) halts the run.
+
+### How cost is counted
+
+The CLI reports `total_cost_usd` as the session's running total, not the cost
+of one turn. The supervisor stores the last total of each session and counts
+only the difference. `--max-budget-usd` applies to one invocation, so
+`max_turn_usd` is a per-turn cap even on a resumed session (both verified on
+2026-10-09).
+
+### Long and hung turns
+
+- Children run with `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, so the CLI waits
+  for a background agent instead of stopping it after 10 minutes. If the CLI
+  still reports that it stopped one, the supervisor asks the child to redo
+  that work in the foreground.
+- A success result counts even when the process then hits the turn timeout.
+- When a child wrote its result but the process stays open with no new output
+  for `UNATTENDED_RESULT_GRACE_S` seconds (default 300), the supervisor sends
+  it SIGINT and uses the result.
+- A failed turn that made progress is retried once. The supervisor logs
+  `RETRY ticket #N (last retry)` and sends a notification.
 
 ## Files
 
@@ -325,7 +354,8 @@ Each proxied merge leaves two records:
   cannot keep a secret from it. The supervisor therefore detects tampering
   instead of preventing it:
   - It halts when the run token disappears or changes during the run.
-  - It halts when the sidecar changes during the run.
+  - It halts when the sidecar's ticket plan changes during the run. A change
+    to the limits is allowed, and each one is logged.
   - It requires a posted Rex review for HEAD, not only the marker file.
   - It reads every template once, before the first child runs.
   - It creates the state, the token, and the logs with mode `600`.

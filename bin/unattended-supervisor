@@ -170,7 +170,13 @@ token_intact() {
 
 # sidecar_fingerprint — the sidecar may change between runs (the owner edits
 # it), but not during one (review of #7, L1).
-sidecar_fingerprint() { [ -f "$SIDECAR" ] && cksum < "$SIDECAR" | tr -d ' '; }
+# Only the four limits are excluded: they are reloaded every turn, so the
+# owner can raise one mid-run without halting it (#13). A mid-run change to
+# anything else, including config.execution_prompt and config.notify_webhook,
+# still halts the run (security review of #14, S1).
+sidecar_fingerprint() {
+  [ -f "$SIDECAR" ] && jq -S 'del(.config.max_turn_usd, .config.max_ticket_usd, .config.max_run_usd, .config.turn_timeout_s)' "$SIDECAR" 2>/dev/null | cksum | tr -d ' '
+}
 
 # token_get <key> — read one key=value from the run token.
 token_get() { [ -f "$TOKEN" ] && sed -n "s/^$1=//p" "$TOKEN" | head -1; }
@@ -229,7 +235,10 @@ notify() {
   return 0
 }
 
-halt() { st_set '.halted = $r' --arg r "$1"; log "HALT: $1"; }
+halt() {
+  st_set '.halted = $r | (.tickets[]? | select(.status == "running") | .status) = "stopped"' --arg r "$1"
+  log "HALT: $1"
+}
 
 # ------------------------------------------------------------------- lock ----
 
@@ -326,9 +335,14 @@ add_decide_cost() {
 
 TURN_TEXT="" TURN_OK=0 TURN_COST=0 TURN_REASON="" TURN_LOG="" APPROVED_SEND=""
 
-# child_turn <session-id> <new|resume> <name> <prompt> <logdir> <ticket|planning>
+# child_turn <session-id> <new|resume> <name> <prompt> <logdir> <ticket|planning> [last-total]
+#
+# Sets TURN_TEXT, TURN_OK, TURN_REASON, TURN_LOG, TURN_TOTAL (the session's
+# running total the CLI reported, or empty) and TURN_COST (this turn's cost:
+# TURN_TOTAL minus last-total, #13), and TURN_BG_STOPPED.
+TURN_TOTAL="" TURN_BG_STOPPED=0 CHILD_PID="" TURN_INTERRUPTED=0
 child_turn() {
-  local sid="$1" mode="$2" name="$3" prompt="$4" logdir="$5" ticket="$6"
+  local sid="$1" mode="$2" name="$3" prompt="$4" logdir="$5" ticket="$6" last_total="${7:-0}"
   local k rc args unset_args v result proxy
   mkdir -p "$logdir"
   k=$(( $(find "$logdir" -maxdepth 1 -name 'turn-*.jsonl' | wc -l) + 1 ))
@@ -367,31 +381,73 @@ child_turn() {
   for v in $SCRUB_VARS; do unset_args+=(-u "$v"); done
   proxy="unattended-plan run=$RUN_ID prd=$PRD ticket=$ticket started_by=$STARTED_BY"
 
-  log "TURN $name #$k ($mode) prompt=$(printf '%s' "$prompt" | head -1 | cut -c1-120)"
+  log "TURN $name #$k ($mode) prompt=$(printf '%s' "$prompt" | grep -m1 '[^[:space:]]' | cut -c1-120)"
   # umask 022 for the child: the supervisor's own umask 077 protects its
   # state, but build output in the project must keep normal modes. Create
   # the turn logs first, under 077, so the redirect keeps them private.
   : > "$TURN_LOG"; : > "$TURN_LOG.err"
-  ( umask 022 && cd "$OPS" && env "${unset_args[@]}" \
+  # CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0: in -p mode the CLI otherwise
+  # stops background agents 10 minutes after the last turn, cuts their work
+  # off mid-file, and then idles until the timeout (#13).
+  # The child runs in the background so the supervisor can watch it: a
+  # process that wrote its result but does not exit gets SIGINT after a
+  # quiet grace period, and its result is used (#13).
+  ( umask 022 && cd "$OPS" && exec env "${unset_args[@]}" \
       APEXYARD_UNATTENDED_SUPERVISED=1 \
       APEXYARD_APPROVAL_PROXY="$proxy" \
       APEXYARD_UNATTENDED_RUN_ID="$RUN_ID" \
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 \
       timeout -s INT --kill-after=120 "$TURN_TIMEOUT_S" \
-      "$CLAUDE_BIN" "${args[@]}" > "$TURN_LOG" 2> "$TURN_LOG.err" < /dev/null )
-  rc=$?
+      "$CLAUDE_BIN" "${args[@]}" > "$TURN_LOG" 2> "$TURN_LOG.err" < /dev/null ) &
+  local cpid=$! seen_size="" quiet_since=0 size grace="${UNATTENDED_RESULT_GRACE_S:-300}" polls=0
+  # The signal trap reads CHILD_PID: a stopped supervisor must not leave its
+  # child running with the lock released (review of #14).
+  CHILD_PID="$cpid"; TURN_INTERRUPTED=0
+  while kill -0 "$cpid" 2>/dev/null; do
+    if grep -q '"type":"result"' "$TURN_LOG" 2>/dev/null; then
+      size="$(wc -c < "$TURN_LOG" 2>/dev/null | tr -d ' ')"
+      if [ "$size" != "$seen_size" ]; then seen_size="$size"; quiet_since=$SECONDS
+      elif [ $((SECONDS - quiet_since)) -ge "$grace" ]; then
+        log "TURN $name #$k: result written and no output for ${grace}s, but the process has not exited: sending SIGINT"
+        kill -INT "$cpid" 2>/dev/null
+        TURN_INTERRUPTED=1
+        break
+      fi
+    fi
+    # Poll fast at first (a short turn ends in well under a second), then
+    # back off to UNATTENDED_POLL_S.
+    polls=$((polls + 1))
+    if [ "$polls" -le 20 ]; then sleep 0.1; else sleep "${UNATTENDED_POLL_S:-5}"; fi
+  done
+  wait "$cpid"; rc=$?
+  CHILD_PID=""
 
   result="$(jq -c 'select(.type == "result")' "$TURN_LOG" 2>/dev/null | tail -1)"
   TURN_TEXT="$(printf '%s' "$result" | jq -r '.result // empty' 2>/dev/null)"
-  TURN_COST="$(printf '%s' "$result" | jq -r '.total_cost_usd // 0' 2>/dev/null)"
-  [ -z "$TURN_COST" ] && TURN_COST=0
+  # total_cost_usd is the SESSION's running total on a resumed turn, not this
+  # turn's cost (verified 2026-10-09). Count only the delta (#13).
+  TURN_TOTAL="$(printf '%s' "$result" | jq -r '.total_cost_usd // empty' 2>/dev/null)"
+  if [ -z "$TURN_TOTAL" ]; then TURN_COST=0
+  elif fge "$TURN_TOTAL" "$last_total"; then TURN_COST="$(awk -v a="$TURN_TOTAL" -v b="$last_total" 'BEGIN { printf "%.6f", a - b }')"
+  else TURN_COST="$TURN_TOTAL"; fi
+  TURN_BG_STOPPED=0
+  grep -q 'Background tasks still running' "$TURN_LOG.err" 2>/dev/null && TURN_BG_STOPPED=1
+  # Our own SIGINT after a quiet result may also have cut off a background
+  # agent that printed nothing, and the CLI then says nothing (review of #14).
+  [ "$TURN_INTERRUPTED" = 1 ] && TURN_BG_STOPPED=1
   TURN_OK=1; TURN_REASON=""
-  if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then TURN_OK=0; TURN_REASON="timeout after ${TURN_TIMEOUT_S}s"
+  # A success result wins over the exit code: a timeout or our SIGINT after
+  # the result does not undo a finished turn (#13).
+  if [ -n "$result" ] && [ "$(printf '%s' "$result" | jq -r '.subtype // "success"')" = success ] \
+     && [ "$(printf '%s' "$result" | jq -r '.is_error // false')" != true ]; then
+    [ "$rc" != 0 ] && log "TURN $name #$k: success result kept although the process exited $rc"
+  elif [ "$rc" = 124 ] || [ "$rc" = 137 ]; then TURN_OK=0; TURN_REASON="timeout after ${TURN_TIMEOUT_S}s"
   elif [ -z "$result" ]; then TURN_OK=0; TURN_REASON="no result event (exit $rc)"
-  elif [ "$(printf '%s' "$result" | jq -r '.subtype // "success"')" != success ] \
-       || [ "$(printf '%s' "$result" | jq -r '.is_error // false')" = true ]; then
+  else
     TURN_OK=0; TURN_REASON="$(printf '%s' "$result" | jq -r '.subtype // "error"')"
   fi
-  log "TURN-END $name #$k ok=$TURN_OK cost=$TURN_COST ${TURN_REASON:+reason=$TURN_REASON}"
+  [ "$TURN_BG_STOPPED" = 1 ] && log "TURN $name #$k: the CLI stopped a background agent before it finished"
+  log "TURN-END $name #$k ok=$TURN_OK cost=$TURN_COST session_total=${TURN_TOTAL:-none} ${TURN_REASON:+reason=$TURN_REASON}"
 }
 
 # child_dirs — the directories a child may use besides the ops root: the
@@ -507,6 +563,33 @@ NUDGE="Your last message did not end with exactly one UNATTENDED- line. End this
 
 DEFAULT_CONFIG='{"execution_prompt":"","max_turn_usd":15,"max_ticket_usd":60,"max_run_usd":300,"turn_timeout_s":5400,"notify_webhook":""}'
 
+# reload_limits — re-read the four limits from the sidecar and log each
+# change. The webhook and the execution prompt stay as read at start.
+reload_limits() {
+  local cfg key var old new
+  cfg="$(jq -c --argjson d "$DEFAULT_CONFIG" '$d + (.config // {})' "$SIDECAR" 2>/dev/null)" || return 0
+  [ -n "$cfg" ] || return 0
+  for key in max_turn_usd:MAX_TURN_USD max_ticket_usd:MAX_TICKET_USD max_run_usd:MAX_RUN_USD turn_timeout_s:TURN_TIMEOUT_S; do
+    var="${key#*:}"; key="${key%%:*}"
+    new="$(printf '%s' "$cfg" | jq -r --arg k "$key" '.[$k] // empty')"
+    old="${!var}"
+    if [ -n "$new" ] && [ "$new" != "$old" ]; then
+      # Only a positive number is a limit. turn_timeout_s 0 would disable the
+      # timeout (security review of #14, S2).
+      if ! printf '%s' "$new" | grep -Eq '^[0-9]+([.][0-9]+)?$' || ! awk -v v="$new" 'BEGIN { exit !(v > 0) }'; then
+        log "CONFIG: ignored $key=$new (not a positive number), keeping $old"
+        continue
+      fi
+      log "CONFIG: $key $old -> $new"
+      printf -v "$var" '%s' "$new"
+      # Every limit change is worth telling the owner about: a child can
+      # write the sidecar too (review of #14).
+      notify config "" "$key changed from $old to $new in the sidecar"
+    fi
+  done
+  return 0
+}
+
 load_config() {
   local cfg
   cfg="$(jq -c --argjson d "$DEFAULT_CONFIG" '$d + (.config // {})' "$SIDECAR")"
@@ -613,9 +696,12 @@ run_planning() {
     if ! token_intact; then needs_owner null token "the run token was removed or changed during planning"; halt "run token removed or changed"; return 1; fi
     turns=$((turns + 1))
     [ "$turns" -gt "$MAX_PLANNING_TURNS" ] && { needs_owner null planning "planning ran $MAX_PLANNING_TURNS turns"; halt "planning did not finish"; return 1; }
-    child_turn "$sid" "$mode" "unattended:$PROJECT:$PRD_BASE:planning" "$prompt" "$STATE_DIR/logs/planning" planning
+    child_turn "$sid" "$mode" "unattended:$PROJECT:$PRD_BASE:planning" "$prompt" "$STATE_DIR/logs/planning" planning \
+      "$(st '.planning.session_total // 0')"
     mode=resume
-    st_set '.planning.turns += 1 | .planning.cost = ((.planning.cost // 0) + $c) | .cost_usd = ((.cost_usd // 0) + $c)' --argjson c "$TURN_COST"
+    st_set '.planning.turns += 1 | .planning.cost = ((.planning.cost // 0) + $c) | .cost_usd = ((.cost_usd // 0) + $c)
+            | .planning.session_total = ($t // .planning.session_total)' \
+      --argjson c "$TURN_COST" --argjson t "${TURN_TOTAL:-null}"
     if h="$(hook_block "$TURN_LOG")"; then needs_owner null privileged "$h blocked a command in planning"; halt "$h blocked a command"; return 1; fi
     if fge "$(st '.cost_usd')" "$MAX_RUN_USD"; then halt "run cost reached max_run_usd ($MAX_RUN_USD)"; return 1; fi
     if [ "$TURN_OK" != 1 ]; then
@@ -781,7 +867,7 @@ work_ticket() {
   local tcost status_line rex round
   sid="$(tk_get "$n" session)"
   if [ -z "$sid" ] || [ "$(tk_get "$n" fresh)" = true ]; then
-    sid="$(new_uuid)"; tk_str "$n" session "$sid"; tk_set "$n" fresh false; mode=new
+    sid="$(new_uuid)"; tk_str "$n" session "$sid"; tk_set "$n" fresh false; tk_set "$n" session_total 0; mode=new
     PROMPT="$(ticket_prompt "$n")"
   else
     mode=resume
@@ -793,14 +879,19 @@ work_ticket() {
   while :; do
     [ -f "$STOP" ] && { halt "stopped by the owner (stop file)"; return 1; }
     if ! token_intact; then needs_owner "$n" token "the run token was removed or changed during the run"; halt "run token removed or changed"; return 1; fi
-    if [ "$(sidecar_fingerprint)" != "$SIDECAR_FP" ]; then needs_owner "$n" sidecar "the sidecar changed during the run"; halt "sidecar changed during the run"; return 1; fi
+    if [ "$(sidecar_fingerprint)" != "$SIDECAR_FP" ]; then needs_owner "$n" sidecar "the sidecar's ticket plan changed during the run"; halt "sidecar changed during the run"; return 1; fi
+    reload_limits
     tcost="$(tk_get "$n" cost)"
     if fge "${tcost:-0}" "$MAX_TICKET_USD"; then needs_owner "$n" budget "ticket cost reached max_ticket_usd ($MAX_TICKET_USD)"; halt "ticket #$n cost ceiling"; return 1; fi
     if fge "$(st '.cost_usd')" "$MAX_RUN_USD"; then halt "run cost reached max_run_usd ($MAX_RUN_USD)"; return 1; fi
     turns=$((turns + 1))
     [ "$turns" -gt "$MAX_TICKET_TURNS" ] && { needs_owner "$n" turns "ticket ran $MAX_TICKET_TURNS turns"; halt "ticket #$n turn ceiling"; return 1; }
 
-    child_turn "$sid" "$mode" "unattended:$PROJECT:$PRD_BASE:ticket-$n" "$PROMPT" "$STATE_DIR/logs/ticket-$n" "$n"
+    tk_str "$n" turn_started "$(date +%H:%M)"
+    child_turn "$sid" "$mode" "unattended:$PROJECT:$PRD_BASE:ticket-$n" "$PROMPT" "$STATE_DIR/logs/ticket-$n" "$n" \
+      "$(tk_get "$n" session_total)"
+    tk_set "$n" turn_started null
+    [ -n "$TURN_TOTAL" ] && tk_set "$n" session_total "$TURN_TOTAL"
     mode=resume
     st_set '(.tickets[] | select(.n == $n)) |= (.turns += 1 | .cost = ((.cost // 0) + $c)) | .cost_usd = ((.cost_usd // 0) + $c)' \
       --argjson n "$n" --argjson c "$TURN_COST"
@@ -820,6 +911,8 @@ work_ticket() {
     if [ "$TURN_OK" != 1 ]; then
       if [ "$progressed" = 1 ] && [ "$(tk_get "$n" retried)" != true ]; then
         tk_set "$n" retried true
+        log "RETRY ticket #$n (last retry): $TURN_REASON"
+        notify retry "$n" "#$n turn failed ($TURN_REASON). Retrying once; the next failure halts the run."
         PROMPT="Your last turn stopped early ($TURN_REASON). Continue from where you stopped."
         continue
       fi
@@ -841,6 +934,16 @@ work_ticket() {
     fi
 
     end="$(up_end_line "$TURN_TEXT")"
+    # The CLI stopped a background agent mid-work: its files may be half
+    # written. Unless the ticket is already finished, make the child redo
+    # that work in the foreground before anything else (#13).
+    if [ "$TURN_BG_STOPPED" = 1 ]; then
+      case "$end" in
+        UNATTENDED-NEXT:*|UNATTENDED-DONE*) ;;
+        *) PROMPT="The CLI stopped your background agent before it finished, so its work may be cut off mid-file. Run git status and check every file it touched. Redo its work in the foreground (never in a background agent), then continue and end the turn with one UNATTENDED- line."
+           continue ;;
+      esac
+    fi
     if [ -z "$end" ] || ! up_is_last_line "$TURN_TEXT"; then
       missing=$((missing + 1))
       case "$missing" in
@@ -948,6 +1051,8 @@ reconcile() {
       fi
     fi
     if [ "$RESUME" = 1 ] && [ "$status" = needs_owner ]; then tk_str "$n" status pending; status=pending; fi
+    # A halt marks the ticket in flight "stopped"; it resumes like a running one.
+    if [ "$status" = stopped ]; then tk_str "$n" status running; status=running; fi
     if [ "$status" = running ] || [ "$status" = pending ]; then
       s=""; [ -n "$pr" ] && s="$(pr_state "$pr")"
       # OPEN or MERGED (ticket still open: QA and closing are left) resume the
@@ -959,6 +1064,30 @@ reconcile() {
       fi
     fi
   done
+}
+
+# on_signal — the supervisor was asked to stop (Ctrl-C in --rehearse, or the
+# SIGTERM fallback of --stop). Interrupt the child turn and wait for it, so
+# no child keeps running unsupervised after the lock is released. The wait
+# is bounded: SIGKILL after UNATTENDED_CHILD_STOP_S seconds (default 120).
+on_signal() {
+  trap '' INT TERM
+  log "signal received, stopping"
+  if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    log "stopping the running child turn (PID $CHILD_PID)"
+    kill -INT "$CHILD_PID" 2>/dev/null
+    local i=0
+    while kill -0 "$CHILD_PID" 2>/dev/null && [ "$i" -lt "${UNATTENDED_CHILD_STOP_S:-120}" ]; do sleep 1; i=$((i + 1)); done
+    if kill -0 "$CHILD_PID" 2>/dev/null; then
+      log "the child did not stop: SIGKILL"
+      pkill -KILL -P "$CHILD_PID" 2>/dev/null; kill -KILL "$CHILD_PID" 2>/dev/null
+    fi
+    wait "$CHILD_PID" 2>/dev/null
+  fi
+  CHILD_PID=""
+  halt "stopped by a signal"
+  write_summary
+  exit 1
 }
 
 # ----------------------------------------------------------------- summary ---
@@ -1006,7 +1135,7 @@ cmd_status() {
   printf 'Run: %s  PRD: %s\n' "$(st '.run_id')" "$PRD"
   if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then printf 'Supervisor: running (PID %s)\n' "$holder"; else printf 'Supervisor: not running\n'; fi
   printf 'Halted: %s\nCost: %s USD\nCurrent: %s\n' "$(st '.halted // "no"')" "$(st '.cost_usd // 0')" "$(st '.current // "none"')"
-  jq -r '.tickets[] | "  #\(.n)  \(.status)\(if .pr then "  PR #\(.pr)" else "" end)  turns=\(.turns // 0)  cost=\(.cost // 0)  \(.title // "")"' "$STATE"
+  jq -r '.tickets[] | "  #\(.n)  \(.status)\(if .pr then "  PR #\(.pr)" else "" end)  turns=\(.turns // 0)  cost=\(.cost // 0)\(if .turn_started then "  turn \((.turns // 0) + 1) running since \(.turn_started)" else "" end)  \(.title // "")"' "$STATE"
   jq -r '.needs_owner[]? | "  needs-owner \(if .ticket then "#\(.ticket)" else "run" end) \(.code): \(.detail)"' "$STATE"
   printf 'Log: %s\n' "$SVLOG"
 }
@@ -1025,7 +1154,7 @@ cmd_dry_run() {
     echo "    --name unattended:$PROJECT:$PRD_BASE:planning --output-format stream-json --verbose \\"
     echo "    --append-system-prompt <templates/unattended-child.md> --permission-mode acceptEdits \\"
     echo "    --permission-prompts none --allowedTools $CHILD_ALLOWED_TOOLS \\"
-    echo "    --disallowedTools $CHILD_DISALLOWED_TOOLS --max-budget-usd 15"
+    echo "    --disallowedTools $CHILD_DISALLOWED_TOOLS --max-budget-usd ${MAX_TURN_USD:-15}"
     echo "Then it verifies each UNATTENDED-TICKETS number with tracker_view and writes the sidecar."
     return 0
   fi
@@ -1065,7 +1194,8 @@ init_state() {
         started_at:$at, epic:null, cost_usd:0, current:null, halted:null, planning:null,
         tickets:[], needs_owner:[]}' > "$STATE"
   else
-    st_set '.run_id = $run | .started_by = $by' --arg run "$RUN_ID" --arg by "$STARTED_BY"
+    # A supervisor that died mid-turn leaves turn_started behind (review of #14).
+    st_set '.run_id = $run | .started_by = $by | (.tickets[]?.turn_started) = null' --arg run "$RUN_ID" --arg by "$STARTED_BY"
   fi
 }
 
@@ -1102,7 +1232,7 @@ cmd_run() {
 
   acquire_lock
   trap 'release_lock' EXIT
-  trap 'log "signal received, stopping"; exit 1' INT TERM
+  trap 'on_signal' INT TERM
   rm -f "$STOP"
   load_tracker_lib
   # Read every template once, before any child runs: a child can write the
