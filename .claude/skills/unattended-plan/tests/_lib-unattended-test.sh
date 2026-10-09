@@ -13,7 +13,8 @@
 UT_REPO="acme/widget"
 
 ut_sandbox() { # → sets SB, FAKE_DIR, OPS_DIR, PRD_FILE, STATE_DIR; exports PATH
-  SB="$(mktemp -d)"
+  # UT_TMP lets a test put the sandbox under a path with a space.
+  SB="$(mktemp -d "${UT_TMP:-${TMPDIR:-/tmp}}/ut.XXXXXX")"
   FAKE_DIR="$SB/fake"; OPS_DIR="$SB/ops"; PRD_FILE="$SB/docs/PRD-001-x.md"
   mkdir -p "$FAKE_DIR/issues" "$FAKE_DIR/prs" "$FAKE_DIR/checks" "$OPS_DIR/.claude/session/reviews" "$SB/docs" "$SB/bin"
   printf '# PRD-001 X\n' > "$PRD_FILE"

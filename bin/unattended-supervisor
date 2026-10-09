@@ -23,7 +23,7 @@
 #
 # Usage:
 #   unattended-supervisor run    --prd <path> --project <name> --repo <owner/repo>
-#                                [--workspace <dir>] [--ops-root <dir>]
+#                                [--workspace <dir>] [--ops-root <dir>] [--portfolio-root <dir>]
 #                                [--plan-only] [--tickets 12,14] [--rehearse]
 #                                [--dry-run] [--resume]
 #   unattended-supervisor status --prd <path> --project <name> [--ops-root <dir>]
@@ -71,14 +71,14 @@ MAX_TICKET_TURNS=80
 
 CMD="${1:-}"
 [ $# -gt 0 ] && shift
-PRD="" PROJECT="" REPO="" WORKSPACE="" OPS=""
+PRD="" PROJECT="" REPO="" WORKSPACE="" OPS="" PORTFOLIO_ROOT=""
 PLAN_ONLY=0 REHEARSE=0 DRY_RUN=0 RESUME=0 TICKET_FILTER=""
 
 usage() {
   cat <<'USAGE'
 Usage:
   unattended-supervisor run    --prd <path> --project <name> --repo <owner/repo>
-                               [--workspace <dir>] [--ops-root <dir>]
+                               [--workspace <dir>] [--ops-root <dir>] [--portfolio-root <dir>]
                                [--plan-only] [--tickets 12,14] [--rehearse]
                                [--dry-run] [--resume]
   unattended-supervisor status --prd <path> --project <name> [--ops-root <dir>]
@@ -93,6 +93,7 @@ while [ $# -gt 0 ]; do
     --repo) REPO="${2:-}"; shift 2 ;;
     --workspace) WORKSPACE="${2:-}"; shift 2 ;;
     --ops-root) OPS="${2:-}"; shift 2 ;;
+    --portfolio-root) PORTFOLIO_ROOT="${2:-}"; shift 2 ;;
     --tickets) TICKET_FILTER="${2:-}"; shift 2 ;;
     --plan-only) PLAN_ONLY=1; shift ;;
     --rehearse) REHEARSE=1; shift ;;
@@ -356,7 +357,11 @@ child_turn() {
          --allowedTools "$CHILD_ALLOWED_TOOLS"
          --disallowedTools "$CHILD_DISALLOWED_TOOLS"
          --max-budget-usd "$MAX_TURN_USD")
-  [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ] && args+=(--add-dir "$WORKSPACE")
+  # A child runs in acceptEdits with no prompts, so every directory it must
+  # read or edit outside the ops root has to be added explicitly (#11).
+  # Read one path per line: a path with a space must stay one argument.
+  local d
+  while IFS= read -r d; do args+=(--add-dir "$d"); done < <(child_dirs)
 
   unset_args=()
   for v in $SCRUB_VARS; do unset_args+=(-u "$v"); done
@@ -387,6 +392,16 @@ child_turn() {
     TURN_OK=0; TURN_REASON="$(printf '%s' "$result" | jq -r '.subtype // "error"')"
   fi
   log "TURN-END $name #$k ok=$TURN_OK cost=$TURN_COST ${TURN_REASON:+reason=$TURN_REASON}"
+}
+
+# child_dirs — the directories a child may use besides the ops root: the
+# project workspace, the portfolio root (registry, project docs), and the
+# PRD's directory. One per line, existing only, no duplicates.
+child_dirs() {
+  local d
+  for d in "$WORKSPACE" "$PORTFOLIO_ROOT" "$(dirname "$PRD")"; do
+    [ -n "$d" ] && [ -d "$d" ] && printf '%s\n' "$d"
+  done | awk '!seen[$0]++'
 }
 
 # hook_block <logfile> → print the halting hook's name when a halt hook blocked
@@ -479,10 +494,10 @@ ticket_prompt() { # <n>
 This session covers only ticket #$n."
   fi
   [ -z "$ep" ] && exec_block="$TPL_GENERIC"
-  exec_block="$(fill "$exec_block" "TICKET=$n" "REPO=$REPO")"
+  exec_block="$(fill "$exec_block" "TICKET=$n" "REPO=$REPO" "BASE=$BASE_BRANCH")"
   fill "$TPL_TICKET" \
     "EXECUTION_PROMPT=$exec_block" "TICKET=$n" "TITLE=$title" "PROJECT=$PROJECT" \
-    "REPO=$REPO" "WORKSPACE=${WORKSPACE:-none}" "PRD=$PRD" "EPIC=$(st '.epic // "none"')" \
+    "REPO=$REPO" "WORKSPACE=${WORKSPACE:-none}" "PRD=$PRD" "EPIC=$(st '.epic // "none"')" "BASE=$BASE_BRANCH" \
     "BLOCKED_BY_PRS=$dep_prs"
 }
 
@@ -502,11 +517,27 @@ load_config() {
   NOTIFY_WEBHOOK="$(printf '%s' "$cfg" | jq -r '.notify_webhook // ""')"
   local ep; ep="$(printf '%s' "$cfg" | jq -r '.execution_prompt // ""')"
   EXEC_PROMPT_TEXT=""
+  if [ -z "$ep" ]; then ep="$(find_execution_prompt)"; [ -n "$ep" ] && log "PROMPT: using $ep (found by convention)"; fi
   if [ -n "$ep" ]; then
     case "$ep" in /*) ;; *) ep="$(dirname "$PRD")/$ep" ;; esac
-    if [ -f "$ep" ]; then EXEC_PROMPT_TEXT="$(cat "$ep")"
+    # Log a checksum: a child can edit files in the PRD's directory, so a
+    # changed prompt between runs must be visible in the log.
+    if [ -f "$ep" ]; then EXEC_PROMPT_TEXT="$(cat "$ep")"; log "PROMPT: $ep cksum $(cksum < "$ep" | cut -d' ' -f1)"
     else log "WARNING: execution_prompt $ep not found, using the generic prompt"; fi
   fi
+  [ -z "$EXEC_PROMPT_TEXT" ] && log "PROMPT: no execution prompt, using the generic ticket prompt"
+  return 0
+}
+
+# find_execution_prompt — the convention when the sidecar names none (#11):
+# execution-prompt-unattended.md in the PRD's directory, then its parent.
+find_execution_prompt() {
+  local d f
+  for d in "$(dirname "$PRD")" "$(dirname "$(dirname "$PRD")")"; do
+    f="$d/execution-prompt-unattended.md"
+    [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 0
 }
 
 # order_tickets <json array of {n,blocked_by}> → space-separated n in
@@ -540,6 +571,12 @@ write_sidecar() {
     js="$(issue_json "$n")"
     if [ -z "$js" ]; then missing="$missing #$n"; continue; fi
     if issue_closed "$n"; then log "PLAN: #$n is closed, dropped"; continue; fi
+    # An epic or sub-epic groups other tickets. It is never worked as a
+    # ticket of its own (#11).
+    if printf '%s' "$js" | jq -e '((.title // "") | test("(?i)\\b(sub-?)?epic\\b"))
+          or ([(.labels // [])[] | (if type == "object" then .name else . end) | ascii_downcase] | any(. == "epic" or . == "sub-epic"))' >/dev/null 2>&1; then
+      log "PLAN: #$n is an epic or sub-epic, dropped"; continue
+    fi
     arr="$(printf '%s' "$arr" | jq -c --argjson n "$n" --argjson js "$js" --arg listed "$listed" '
       . + [{ n: $n,
              title: ($js.title // "" | sub("^\\[[A-Za-z]+\\] *"; "")),
@@ -862,6 +899,41 @@ work_ticket() {
   done
 }
 
+# prepare_workspace — the children build in the workspace clone. Clone it
+# when it is missing. A repo with no branch cannot take a PR: halt with the
+# one fix the owner must make (#11).
+prepare_workspace() {
+  [ -n "$WORKSPACE" ] || return 0
+  local branches origin
+  if ! branches="$(gh api "repos/$REPO/branches" --jq 'length' 2>/dev/null)"; then
+    needs_owner null workspace "could not list the branches of $REPO (check gh auth and the network)"
+    halt "could not reach $REPO"; return 1
+  fi
+  if [ "${branches:-0}" = 0 ]; then
+    needs_owner null empty-repo "$REPO has no branch. Push one initial commit to its default branch, then run --resume"
+    halt "$REPO has no commits"; return 1
+  fi
+  # An existing clone (or worktree: .git may be a file) must be of $REPO.
+  if [ -e "$WORKSPACE/.git" ]; then
+    origin="$(git -C "$WORKSPACE" remote get-url origin 2>/dev/null)"
+    origin="$(printf '%s' "$origin" | sed -E 's#\.git$##; s#^(https?://[^/]+/|git@[^:]+:|ssh://git@[^/]+/)##' | tr '[:upper:]' '[:lower:]')"
+    if [ "$origin" = "$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" ]; then return 0; fi
+    needs_owner null workspace "$WORKSPACE is a clone of ${origin:-an unknown repo}, not $REPO"
+    halt "workspace is a clone of another repo"; return 1
+  fi
+  if [ -e "$WORKSPACE" ] && [ -n "$(ls -A "$WORKSPACE" 2>/dev/null)" ]; then
+    needs_owner null workspace "$WORKSPACE exists but is not a git clone"
+    halt "workspace is not a clone"; return 1
+  fi
+  log "WORKSPACE: cloning $REPO into $WORKSPACE"
+  mkdir -p "$(dirname "$WORKSPACE")"
+  if ! gh repo clone "$REPO" "$WORKSPACE" >/dev/null 2>&1; then
+    needs_owner null workspace "could not clone $REPO into $WORKSPACE"
+    halt "workspace clone failed"; return 1
+  fi
+  return 0
+}
+
 # reconcile — trust the tracker and GitHub over state.json (PRD US-7).
 reconcile() {
   local n status pr s
@@ -969,7 +1041,7 @@ cmd_dry_run() {
   echo "    timeout -s INT --kill-after=120 $TURN_TIMEOUT_S $CLAUDE_BIN -p <ticket prompt> --session-id <uuid> (then --resume <uuid>) \\"
   echo "    --name unattended:$PROJECT:$PRD_BASE:ticket-<n> --output-format stream-json --verbose \\"
   echo "    --append-system-prompt <templates/unattended-child.md> --permission-mode acceptEdits --permission-prompts none \\"
-  echo "    --allowedTools $CHILD_ALLOWED_TOOLS --disallowedTools $CHILD_DISALLOWED_TOOLS --max-budget-usd $MAX_TURN_USD${WORKSPACE:+ --add-dir $WORKSPACE}"
+  echo "    --allowedTools $CHILD_ALLOWED_TOOLS --disallowedTools $CHILD_DISALLOWED_TOOLS --max-budget-usd $MAX_TURN_USD$(child_dirs | while IFS= read -r d; do printf " --add-dir %q" "$d"; done)"
   echo "  gh pr view <pr> --repo $REPO --json number,state,isDraft,headRefOid,headRefName,url"
   echo "  gh pr checks <pr> --repo $REPO --json bucket"
   echo "  tracker_view <n> $REPO"
@@ -1035,7 +1107,9 @@ cmd_run() {
   load_tracker_lib
   # Read every template once, before any child runs: a child can write the
   # ops root, so a later re-read would let it shape the next prompt (H1).
-  CHILD_RULES="$(strip_comment < "$LIB_ROOT/templates/unattended-child.md")"
+  BASE_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null)"
+  [ -n "$BASE_BRANCH" ] || BASE_BRANCH=main
+  CHILD_RULES="$(fill "$(strip_comment < "$LIB_ROOT/templates/unattended-child.md")" "BASE=$BASE_BRANCH")"
   TPL_PLANNING="$(strip_comment < "$LIB_ROOT/templates/unattended-planning-session.md")"
   TPL_TICKET="$(strip_comment < "$LIB_ROOT/templates/unattended-ticket-session.md")"
   TPL_GENERIC="$(strip_comment < "$LIB_ROOT/templates/unattended-ticket-generic.md")"
@@ -1061,6 +1135,7 @@ cmd_run() {
     log "PLAN-ONLY: stopping after the sidecar"; cat "$SIDECAR"; exit 0
   fi
 
+  if ! prepare_workspace; then write_summary; exit 1; fi
   SIDECAR_FP="$(sidecar_fingerprint)"
   if ! merge_tickets; then halt "could not merge the sidecar into the run state"; write_summary; exit 1; fi
   if [ "$(st '.tickets | length')" = 0 ]; then halt "no tickets to work (check the sidecar and --tickets)"; write_summary; exit 1; fi

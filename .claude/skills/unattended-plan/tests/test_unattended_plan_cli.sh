@@ -64,7 +64,11 @@ check "foreground run completes" '[ "$RC" = 0 ]' "$OUT"
 check "token has run_id, prd, project, started_by" \
   'grep -q "^run_id=20" "$STATE_DIR/run.token" && grep -qx "prd=$PRD_FILE" "$STATE_DIR/run.token" && grep -qx "project=widget" "$STATE_DIR/run.token" && grep -qx "started_by=owner-cli-session" "$STATE_DIR/run.token"'
 check "child sees the run id from the token" 'grep -q "run=$(sed -n "s/^run_id=//p" "$STATE_DIR/run.token")" "$FAKE_DIR/env.log"'
-check "workspace resolved for --add-dir (absent dir is skipped)" '! grep -q -- "--add-dir" "$FAKE_DIR/argv.log"'
+check "missing workspace is cloned before the first ticket" '[ "$(cat "$FAKE_DIR/cloned" 2>/dev/null)" = acme/widget ] && [ -d "$SB/workspace/widget/.git" ]'
+check "children get --add-dir for the workspace, the portfolio root, and the PRD dir" \
+  'grep "^ticket_12" "$FAKE_DIR/argv.log" | head -1 | grep -qF -- "--add-dir $SB/workspace/widget" &&
+   grep "^ticket_12" "$FAKE_DIR/argv.log" | head -1 | grep -qF -- "--add-dir $SB " &&
+   grep "^ticket_12" "$FAKE_DIR/argv.log" | head -1 | grep -qF -- "--add-dir $SB/docs"' "$(grep "^ticket_12" "$FAKE_DIR/argv.log" | head -1 | grep -o -- "--add-dir [^ ]*" | tr "\n" " ")"
 cli "$PRD_FILE" --status
 check "--status prints the run" '[ "$RC" = 0 ] && printf "%s" "$OUT" | grep -q "#13  done  PR #102"' "$OUT"
 cli "$PRD_FILE" --stop
