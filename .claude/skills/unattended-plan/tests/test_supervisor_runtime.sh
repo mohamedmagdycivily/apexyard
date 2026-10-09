@@ -58,10 +58,31 @@ check "bg: the next prompt asks for a foreground redo, not a nudge" 'grep -q "st
 check "bg: a stop on a finished ticket (NEXT) does not block it" '[ "$RC" = 0 ] && [ "$(state ".tickets[0].status")" = done ]' "$OUT"
 cleanup
 
+echo "== a signal stops the child too"
+ut_sandbox; one_ticket 120; export FAKE_SCENARIO="$HERE/scenarios/rt-hang-signal.sh"
+( cd "$SB" && UNATTENDED_RESULT_GRACE_S=600 UNATTENDED_CHILD_STOP_S=10 exec "$UT_SUPERVISOR" run --prd "$PRD_FILE" --project widget --repo "$UT_REPO" --ops-root "$OPS_DIR" ) > "$SB/sv.out" 2>&1 &
+SVPID=$!
+for _ in $(seq 1 100); do [ -f "$FAKE_DIR/pid.ticket_12.1" ] && break; sleep 0.1; done
+sleep 0.5
+CHILDPID="$(cat "$FAKE_DIR/pid.ticket_12.1" 2>/dev/null)"
+START=$SECONDS; kill -TERM "$SVPID"; wait "$SVPID"; RC=$?
+check "signal: the supervisor exits non-zero within the stop bound" '[ "$RC" != 0 ] && [ $((SECONDS - START)) -le 20 ]' "rc=$RC elapsed=$((SECONDS - START))s"
+check "signal: the child turn is gone when the supervisor exits" '[ -n "$CHILDPID" ] && ! kill -0 "$CHILDPID" 2>/dev/null' "child pid ${CHILDPID:-none}"
+check "signal: the lock is released and the run halted" '[ ! -f "$STATE_DIR/lock" ] && state ".halted" | grep -q "stopped by a signal" && [ "$(state ".tickets[0].status")" = stopped ]'
+check "signal: the stop is logged with the child PID" 'grep -q "stopping the running child turn (PID" "$STATE_DIR/supervisor.log"'
+cleanup
+
+echo "== supervisor SIGINT counts as a possible background stop"
+ut_sandbox; one_ticket 60
+UNATTENDED_RESULT_GRACE_S=2 UNATTENDED_POLL_S=1 run_scenario rt-timeout-success
+check "grace: after our SIGINT the next prompt asks for a foreground redo" 'grep -q "stopped your background agent" "$FAKE_DIR/prompt.ticket_12.2"' "$(head -c 300 "$FAKE_DIR/prompt.ticket_12.2")"
+cleanup
+
 echo "== live limits"
-ut_sandbox; one_ticket; export SIDECAR_FILE="$SB/docs/PRD-001-x.unattended.json"; run_scenario rt-live-config
+ut_sandbox; one_ticket; export SIDECAR_FILE="$SB/docs/PRD-001-x.unattended.json"; DISPLAY=:99 run_scenario rt-live-config
 check "config: a limit edit mid-run does not halt the run" '[ "$RC" = 0 ] && [ "$(state ".halted")" = null ]' "$OUT"
 check "config: each change is logged" 'grep -q "CONFIG: max_turn_usd 15 -> 33" "$STATE_DIR/supervisor.log" && grep -q "CONFIG: max_run_usd 300 -> 999" "$STATE_DIR/supervisor.log"'
+check "config: a raised run ceiling is notified" 'grep -q "max_run_usd raised from 300 to 999" "$FAKE_DIR/notify.log"' "$(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
 check "config: the next turn uses the new per-turn budget" 'grep "^ticket_12" "$FAKE_DIR/argv.log" | sed -n 2p | grep -q -- "--max-budget-usd 33"'
 cleanup
 

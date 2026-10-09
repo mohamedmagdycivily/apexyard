@@ -336,7 +336,7 @@ TURN_TEXT="" TURN_OK=0 TURN_COST=0 TURN_REASON="" TURN_LOG="" APPROVED_SEND=""
 # Sets TURN_TEXT, TURN_OK, TURN_REASON, TURN_LOG, TURN_TOTAL (the session's
 # running total the CLI reported, or empty) and TURN_COST (this turn's cost:
 # TURN_TOTAL minus last-total, #13), and TURN_BG_STOPPED.
-TURN_TOTAL="" TURN_BG_STOPPED=0
+TURN_TOTAL="" TURN_BG_STOPPED=0 CHILD_PID="" TURN_INTERRUPTED=0
 child_turn() {
   local sid="$1" mode="$2" name="$3" prompt="$4" logdir="$5" ticket="$6" last_total="${7:-0}"
   local k rc args unset_args v result proxy
@@ -396,6 +396,9 @@ child_turn() {
       timeout -s INT --kill-after=120 "$TURN_TIMEOUT_S" \
       "$CLAUDE_BIN" "${args[@]}" > "$TURN_LOG" 2> "$TURN_LOG.err" < /dev/null ) &
   local cpid=$! seen_size="" quiet_since=0 size grace="${UNATTENDED_RESULT_GRACE_S:-300}" polls=0
+  # The signal trap reads CHILD_PID: a stopped supervisor must not leave its
+  # child running with the lock released (review of #14).
+  CHILD_PID="$cpid"; TURN_INTERRUPTED=0
   while kill -0 "$cpid" 2>/dev/null; do
     if grep -q '"type":"result"' "$TURN_LOG" 2>/dev/null; then
       size="$(wc -c < "$TURN_LOG" 2>/dev/null | tr -d ' ')"
@@ -403,6 +406,7 @@ child_turn() {
       elif [ $((SECONDS - quiet_since)) -ge "$grace" ]; then
         log "TURN $name #$k: result written and no output for ${grace}s, but the process has not exited: sending SIGINT"
         kill -INT "$cpid" 2>/dev/null
+        TURN_INTERRUPTED=1
         break
       fi
     fi
@@ -412,6 +416,7 @@ child_turn() {
     if [ "$polls" -le 20 ]; then sleep 0.1; else sleep "${UNATTENDED_POLL_S:-5}"; fi
   done
   wait "$cpid"; rc=$?
+  CHILD_PID=""
 
   result="$(jq -c 'select(.type == "result")' "$TURN_LOG" 2>/dev/null | tail -1)"
   TURN_TEXT="$(printf '%s' "$result" | jq -r '.result // empty' 2>/dev/null)"
@@ -423,6 +428,9 @@ child_turn() {
   else TURN_COST="$TURN_TOTAL"; fi
   TURN_BG_STOPPED=0
   grep -q 'Background tasks still running' "$TURN_LOG.err" 2>/dev/null && TURN_BG_STOPPED=1
+  # Our own SIGINT after a quiet result may also have cut off a background
+  # agent that printed nothing, and the CLI then says nothing (review of #14).
+  [ "$TURN_INTERRUPTED" = 1 ] && TURN_BG_STOPPED=1
   TURN_OK=1; TURN_REASON=""
   # A success result wins over the exit code: a timeout or our SIGINT after
   # the result does not undo a finished turn (#13).
@@ -563,6 +571,11 @@ reload_limits() {
     old="${!var}"
     if [ -n "$new" ] && [ "$new" != "$old" ]; then
       log "CONFIG: $key $old -> $new"
+      # A raised cost ceiling is worth telling the owner about: a child can
+      # write the sidecar too (review of #14).
+      case "$key" in max_ticket_usd|max_run_usd)
+        fge "$new" "${old:-0}" && notify config "" "$key raised from $old to $new in the sidecar" ;;
+      esac
       printf -v "$var" '%s' "$new"
     fi
   done
@@ -1045,6 +1058,30 @@ reconcile() {
   done
 }
 
+# on_signal — the supervisor was asked to stop (Ctrl-C in --rehearse, or the
+# SIGTERM fallback of --stop). Interrupt the child turn and wait for it, so
+# no child keeps running unsupervised after the lock is released. The wait
+# is bounded: SIGKILL after UNATTENDED_CHILD_STOP_S seconds (default 120).
+on_signal() {
+  trap '' INT TERM
+  log "signal received, stopping"
+  if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    log "stopping the running child turn (PID $CHILD_PID)"
+    kill -INT "$CHILD_PID" 2>/dev/null
+    local i=0
+    while kill -0 "$CHILD_PID" 2>/dev/null && [ "$i" -lt "${UNATTENDED_CHILD_STOP_S:-120}" ]; do sleep 1; i=$((i + 1)); done
+    if kill -0 "$CHILD_PID" 2>/dev/null; then
+      log "the child did not stop: SIGKILL"
+      pkill -KILL -P "$CHILD_PID" 2>/dev/null; kill -KILL "$CHILD_PID" 2>/dev/null
+    fi
+    wait "$CHILD_PID" 2>/dev/null
+  fi
+  CHILD_PID=""
+  halt "stopped by a signal"
+  write_summary
+  exit 1
+}
+
 # ----------------------------------------------------------------- summary ---
 
 write_summary() {
@@ -1149,7 +1186,8 @@ init_state() {
         started_at:$at, epic:null, cost_usd:0, current:null, halted:null, planning:null,
         tickets:[], needs_owner:[]}' > "$STATE"
   else
-    st_set '.run_id = $run | .started_by = $by' --arg run "$RUN_ID" --arg by "$STARTED_BY"
+    # A supervisor that died mid-turn leaves turn_started behind (review of #14).
+    st_set '.run_id = $run | .started_by = $by | (.tickets[]?.turn_started) = null' --arg run "$RUN_ID" --arg by "$STARTED_BY"
   fi
 }
 
@@ -1186,7 +1224,7 @@ cmd_run() {
 
   acquire_lock
   trap 'release_lock' EXIT
-  trap 'log "signal received, stopping"; exit 1' INT TERM
+  trap 'on_signal' INT TERM
   rm -f "$STOP"
   load_tracker_lib
   # Read every template once, before any child runs: a child can write the
