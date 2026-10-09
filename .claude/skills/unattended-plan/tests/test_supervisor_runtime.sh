@@ -82,8 +82,17 @@ echo "== live limits"
 ut_sandbox; one_ticket; export SIDECAR_FILE="$SB/docs/PRD-001-x.unattended.json"; DISPLAY=:99 run_scenario rt-live-config
 check "config: a limit edit mid-run does not halt the run" '[ "$RC" = 0 ] && [ "$(state ".halted")" = null ]' "$OUT"
 check "config: each change is logged" 'grep -q "CONFIG: max_turn_usd 15 -> 33" "$STATE_DIR/supervisor.log" && grep -q "CONFIG: max_run_usd 300 -> 999" "$STATE_DIR/supervisor.log"'
-check "config: a raised run ceiling is notified" 'grep -q "max_run_usd raised from 300 to 999" "$FAKE_DIR/notify.log"' "$(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
+check "config: every limit change is notified" 'grep -q "max_run_usd changed from 300 to 999" "$FAKE_DIR/notify.log" && grep -q "max_turn_usd changed from 15 to 33" "$FAKE_DIR/notify.log"' "$(cat "$FAKE_DIR/notify.log" 2>/dev/null)"
 check "config: the next turn uses the new per-turn budget" 'grep "^ticket_12" "$FAKE_DIR/argv.log" | sed -n 2p | grep -q -- "--max-budget-usd 33"'
+cleanup
+
+echo "== config edits that are not limits"
+ut_sandbox; one_ticket; export SIDECAR_FILE="$SB/docs/PRD-001-x.unattended.json"; run_scenario rt-config-webhook
+check "config: a mid-run webhook change halts the run" '[ "$RC" = 1 ] && state ".halted" | grep -q "sidecar changed during the run"' "$OUT"
+cleanup
+ut_sandbox; one_ticket; export SIDECAR_FILE="$SB/docs/PRD-001-x.unattended.json"; run_scenario rt-config-bad
+check "config: non-positive and non-numeric limits are ignored" '[ "$RC" = 0 ] && grep -q "CONFIG: ignored turn_timeout_s=0" "$STATE_DIR/supervisor.log" && grep -q "CONFIG: ignored max_run_usd=lots" "$STATE_DIR/supervisor.log"' "$OUT"
+check "config: the turn timeout stays in force" '! grep -q "CONFIG: turn_timeout_s" "$STATE_DIR/supervisor.log"'
 cleanup
 
 echo "== retry notice"

@@ -250,7 +250,7 @@ check, and the run halts with no progress.
 | The run token is missing at an approval | Halt. |
 | The stop file exists | Finish the turn, then halt. |
 | The run cost reaches `max_run_usd` | Halt. |
-| The sidecar's ticket plan (anything outside `config`) changes during the run | Needs-owner item, halt. |
+| The sidecar changes during the run, other than the four limits | Needs-owner item, halt. |
 
 ## The sidecar
 
@@ -273,9 +273,10 @@ check, and the run halts with no progress.
 
 You can raise or lower the four limits (`max_turn_usd`, `max_ticket_usd`,
 `max_run_usd`, `turn_timeout_s`) while a run is going. The supervisor reads
-them again before every turn and logs each change as
-`CONFIG: <key> <old> -> <new>`. A change to the ticket plan still halts the
-run. The execution prompt and the webhook stay as they were at the start.
+them again before every turn, logs each change as
+`CONFIG: <key> <old> -> <new>`, and sends a notification. A value that is not a
+positive number is ignored and logged. A mid-run change to anything else in the
+sidecar (the ticket plan, `execution_prompt`, `notify_webhook`) halts the run.
 
 ### How cost is counted
 
